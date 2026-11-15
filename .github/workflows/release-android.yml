@@ -1,0 +1,50 @@
+name: Build signed Android APK
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  signed-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools platforms;android-35 build-tools;35.0.0
+          log-accepted-android-sdk-licenses: false
+      - run: npm ci
+      - run: npm run build && npm run check && npm test
+      - run: npm run android:prepare
+      - name: Restore release keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          test -n "$KEYSTORE_BASE64" || { echo 'Add Android signing secrets first'; exit 1; }
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/khum-release.jks"
+      - name: Build signed APK
+        working-directory: android
+        env:
+          KHUM_KEYSTORE_PATH: ${{ runner.temp }}/khum-release.jks
+          KHUM_STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KHUM_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KHUM_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          test -n "$KHUM_STORE_PASSWORD" && test -n "$KHUM_KEY_ALIAS" && test -n "$KHUM_KEY_PASSWORD"
+          chmod +x gradlew
+          ./gradlew assembleRelease
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KhuM-PoS-signed-release
+          path: android/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+      - name: Remove temporary keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/khum-release.jks"
