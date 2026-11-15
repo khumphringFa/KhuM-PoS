@@ -1,0 +1,10 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "khum-pos",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-08-01",
+  "assets": {"directory": "./public", "binding": "ASSETS", "run_worker_first": ["/api/*"]},
+  "d1_databases": [{"binding": "DB", "database_name": "khum-pos", "database_id": "00000000-0000-0000-0000-000000000000", "migrations_dir": "migrations"}],
+  "triggers": {"crons": ["0 3 * * *"]},
+  "vars": {"GOOGLE_CLIENT_ID": "", "MASTER_GOOGLE_SUB": "", "APP_ORIGIN": "", "ANDROID_ORIGIN": "https://localhost"}
+}
