@@ -25,7 +25,7 @@
   },
   "vars": {
     "GOOGLE_CLIENT_ID": "873330227870-v1m2m0005019i3h8m7vaifl155l8117e.apps.googleusercontent.com",
-    "MASTER_GOOGLE_SUB": "",
+    "MASTER_GOOGLE_SUB": "113280638163187239916",
     "APP_ORIGIN": "https://khum-pos.manas-tripura.workers.dev",
     "ANDROID_ORIGIN": "https://localhost"
   },
