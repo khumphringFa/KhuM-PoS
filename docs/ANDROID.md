@@ -28,3 +28,11 @@ The app ID is `com.khum.pos`. v0.1.0 uses versionCode 1 and versionName 0.1.0; i
 A debug APK and a release APK have different signing identities. Android may require uninstalling a debug build before installing release; export/sync testing data before uninstalling. Production upgrades must use the same permanent release key.
 
 Physical-device testing of camera, offline restart, export, Google device linking, keyboard scanners and printing is required before sharing with shopkeepers.
+
+## Automatic GitHub Releases
+
+The **Publish APKs to Releases** workflow archives successful Android build artifacts as downloadable APK assets on this repository's Releases page. It watches both the testing and signed Android workflows across branches. Testing builds are clearly marked as prereleases; signed builds are regular releases. APKs from fork repositories and unsuccessful builds are not published.
+
+Each build has its own release/tag and artifact-specific APK filename. Existing release assets are preserved, and rerunning the publisher does not upload the same artifact twice. Release assets remain available after Actions artifacts expire.
+
+The first publisher run backfills all available successful historical builds. You can run the publisher manually from Actions to repeat that backfill. Expired Actions artifacts that were never copied to Releases cannot be recovered by this workflow; the logs identify any skipped expired artifacts. No new signing key is created by publication.
