@@ -40,7 +40,7 @@ let db,
   busy = false,
   syncing = false;
 let auth = localStorage.getItem("khum-session") || "",
-  apiBase = localStorage.getItem("khum-api") || "",
+  apiBase = localStorage.getItem("khum-api") || (native ? "https://khum-pos.manas-tripura.workers.dev" : ""),
   config = {};
 let pairing = null,
   stream = null;
