@@ -1,66 +1,1078 @@
-import {money,today,totals,validateCart,lineTotal,integer} from './core.js';
-import {Browser,Capacitor,Filesystem,Directory,Encoding,Share} from './native.js';
-const $=s=>document.querySelector(s),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const native=Capacitor.isNativePlatform();let db,user=null,shops=[],selected=localStorage.getItem('khum-shop')||'local',view='counter',category='All',search='',cart=[],state=null,busy=false,syncing=false;
-let auth=localStorage.getItem('khum-session')||'',apiBase=localStorage.getItem('khum-api')||'',config={};let pairing=null,stream=null;
-const localShop={id:'local',name:'My local store',address:'',phone:'',role:'owner'};
-const icons={Rice:'🍚',Oil:'🫗',Dairy:'🥛',Snacks:'🍪',Drinks:'🧃',Household:'🧼',Vegetables:'🥬',Other:'📦'};
-const seed=[['Miniket rice','Rice','kg',7200,6400,50000,'89010001'],['Soybean oil · 1 litre','Oil','piece',17500,16000,24000,'89010002'],['Fresh milk · 500 ml','Dairy','piece',5500,4700,18000,'89010003'],['Butter cookies','Snacks','piece',6500,5200,32000,'89010004'],['Mango juice · 250 ml','Drinks','piece',3000,2400,40000,'89010005'],['Dishwashing bar','Household','piece',4000,3200,20000,'89010006'],['Green vegetables','Vegetables','kg',6000,4300,12000,'89010007'],['Potato crackers','Snacks','piece',2000,1600,45000,'89010008']].map((p,i)=>({id:'sample-'+i,name:p[0],category:p[1],unit:p[2],price:p[3],cost:p[4],stock:p[5],barcode:p[6],low_stock:5000,expiry:'',version:1}));
-const empty=()=>({products:[],sales:[],pending:[],shop:{...localShop}});
-const key=()=>selected==='local'?'local':`${user?.id||'signed-out'}:${selected}`;
-const shop=()=>selected==='local'?state?.shop||localShop:shops.find(s=>s.id===selected)||state?.shop||{};
-const canEdit=()=>['owner','master'].includes(shop().role);
-const qty=n=>new Intl.NumberFormat('en-BD',{maximumFractionDigits:3}).format(n/1000);
-const cents=s=>Math.round(Number(s)*100),milli=s=>Math.round(Number(s)*1000);
-const showError=e=>toast(e.message||String(e));
-function toast(s){$('#toast').textContent=s;$('#toast').style.display='block';clearTimeout(toast.timer);toast.timer=setTimeout(()=>$('#toast').style.display='none',6000);}
-async function openDB(){db=await new Promise((resolve,reject)=>{const r=indexedDB.open('khum-pos',1);r.onupgradeneeded=()=>r.result.createObjectStore('workspaces');r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error);});}
-function read(k){return new Promise((resolve,reject)=>{const r=db.transaction('workspaces').objectStore('workspaces').get(k);r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error);});}
-function save(value=state,k=key()){return new Promise((resolve,reject)=>{const tx=db.transaction('workspaces','readwrite'),store=tx.objectStore('workspaces');let conflict=false;const request=store.get(k);request.onsuccess=()=>{if((request.result?.revision||0)!==(value.revision||0)){conflict=true;tx.abort();return;}value.revision=(value.revision||0)+1;store.put(structuredClone(value),k);};tx.oncomplete=resolve;tx.onerror=()=>reject(Error('Could not save on this device. Free storage and try again.'));tx.onabort=()=>reject(Error(conflict?'Another tab changed this workspace. Reload before continuing; this action was not saved.':'Device save was interrupted.'));});}
-async function api(path,options={}){const res=await fetch(apiBase+path,{...options,headers:{'Content-Type':'application/json',...(auth?{Authorization:`Bearer ${auth}`} :{}),...options.headers}});const data=await res.json();if(!res.ok)throw Object.assign(Error(data.error||'Request failed'),{status:res.status});return data;}
-async function loadWorkspace(){state=await read(key())||empty();if(selected!=='local')state.shop={...shop()};cart=[];render();}
-async function refresh(){if(selected==='local'||!auth)return;if(state.pending.length)throw Error('Sync pending sales before refreshing stock.');const snap=await api(`/api/shops/${selected}/snapshot`);const next={...state,shop:snap.shop,products:snap.products,sales:snap.sales};await save(next);state=next;render();}
-async function loadMe(){const me=await api('/api/me');user=me.user;shops=me.shops;localStorage.setItem('khum-user',JSON.stringify(user));localStorage.setItem('khum-shops',JSON.stringify(shops));if(selected!=='local'&&!shops.some(s=>s.id===selected))selected=shops[0]?.id||'local';}
-function modal(html){stopCamera();$('#modal-body').innerHTML=html;$('#modal').showModal();}
-function closeModal(){stopCamera();$('#modal').close();}
-function stopCamera(){stream?.getTracks().forEach(t=>t.stop());stream=null;}
-$('#close-modal').onclick=closeModal;$('#modal').addEventListener('close',stopCamera);
-const nav=[['counter','▦','Counter'],['stock','▣','Stock'],['sales','↗','Sales'],['settings','⚙','Settings']];
-function render(){if(!state)return;const s=shop(),pending=state.pending.length;$('#app').innerHTML=`<div class="shell"><aside class="rail"><div class="brand">K.</div>${nav.map(([id,i,t])=>`<button data-view="${id}" class="${view===id?'active':''}" aria-label="${t}"><span>${i}</span>${t}</button>`).join('')}${user?.master?`<button data-view="admin" class="${view==='admin'?'active':''}"><span>♜</span>Platform</button>`:''}<button class="bottom" data-action="account"><span>◎</span>Account</button></aside><main class="main"><header class="topbar"><div class="inline"><div class="wordmark">KhuM <b>PoS</b></div><span class="muted">/</span><select id="shop-select" class="shopselect" aria-label="Select shop"><option value="local">${esc(state.shop?.id==='local'?state.shop.name:'Local workspace')}</option>${shops.map(x=>`<option value="${esc(x.id)}" ${selected===x.id?'selected':''}>${esc(x.name)}${x.active?'':' · suspended'}</option>`).join('')}</select></div><div class="top-actions"><span class="badge ${pending||!navigator.onLine?'warn':''}">${selected==='local'?'LOCAL ONLY':pending?`${pending} pending`:navigator.onLine?'CLOUD CONNECTED':'OFFLINE'}</span><button class="text-button" data-action="sync">↻ Sync</button><button class="avatar" data-action="account" aria-label="Account">${esc((user?.name||'K')[0])}</button></div></header><div class="workspace"><div class="intro"><div><div class="eyebrow">${view==='counter'?'Your everyday counter':esc(s.name||'KhuM PoS')}</div><h1>${({counter:'Good things, in store.',stock:'Everything on your shelves.',sales:'Every sale, accounted for.',settings:'Make it your store.',admin:'Your platform, at a glance.'})[view]}</h1><p class="muted" style="font-size:13px;margin-bottom:0">${({counter:'A little less paperwork. A little more business.',stock:'Keep prices and quantities up to date.',sales:'Local receipts and the latest 500 cloud sales.',settings:'Shop details, team access and your data.',admin:'Manage shops and review platform activity.'})[view]}</p></div><span class="date muted">${new Date().toLocaleDateString('en-GB',{day:'numeric',month:'long',year:'numeric',timeZone:'Asia/Dhaka'})}</span></div>${selected==='local'?'<div class="notice">Local workspace · Saved on this device only. Sign in and create a cloud shop to share stock between devices. Local sample data stays separate.</div>':''}${state.pending.some(p=>p.error)?'<div class="notice">A pending sale needs attention. Open Sales to review the sync error. Keep this device’s backup until resolved.</div>':''}<div id="content"></div><div class="footer-note">KhuM PoS · Made for your everyday business · v0.1.0</div></div></main></div>`;
- $('#shop-select').value=selected;$('#shop-select').disabled=syncing;$('#shop-select').onchange=async e=>{selected=e.target.value;localStorage.setItem('khum-shop',selected);await loadWorkspace();if(selected!=='local')try{await refresh();}catch(e){showError(e);}};
- document.querySelectorAll('[data-view]').forEach(b=>b.onclick=()=>{view=b.dataset.view;render();});document.querySelectorAll('[data-action="account"]').forEach(b=>b.onclick=account);$('[data-action="sync"]').onclick=()=>sync().catch(showError);
- if(view==='counter')counter();if(view==='stock')stock();if(view==='sales')sales();if(view==='settings')settings();if(view==='admin')admin().catch(showError);
+import {
+  money,
+  today,
+  totals,
+  validateCart,
+  lineTotal,
+  integer,
+} from "./core.js";
+import {
+  Browser,
+  Capacitor,
+  Filesystem,
+  Directory,
+  Encoding,
+  Share,
+} from "./native.js";
+const $ = (s) => document.querySelector(s),
+  esc = (s) =>
+    String(s ?? "").replace(
+      /[&<>"']/g,
+      (c) =>
+        ({
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#39;",
+        })[c],
+    );
+const native = Capacitor.isNativePlatform();
+let db,
+  user = null,
+  shops = [],
+  selected = localStorage.getItem("khum-shop") || "local",
+  view = "counter",
+  category = "All",
+  search = "",
+  cart = [],
+  state = null,
+  busy = false,
+  syncing = false;
+let auth = localStorage.getItem("khum-session") || "",
+  apiBase = localStorage.getItem("khum-api") || "",
+  config = {};
+let pairing = null,
+  stream = null;
+const localShop = {
+  id: "local",
+  name: "My local store",
+  address: "",
+  phone: "",
+  role: "owner",
+};
+const icons = {
+  Rice: "🍚",
+  Oil: "🫗",
+  Dairy: "🥛",
+  Snacks: "🍪",
+  Drinks: "🧃",
+  Household: "🧼",
+  Vegetables: "🥬",
+  Other: "📦",
+};
+const seed = [
+  ["Miniket rice", "Rice", "kg", 7200, 6400, 50000, "89010001"],
+  ["Soybean oil · 1 litre", "Oil", "piece", 17500, 16000, 24000, "89010002"],
+  ["Fresh milk · 500 ml", "Dairy", "piece", 5500, 4700, 18000, "89010003"],
+  ["Butter cookies", "Snacks", "piece", 6500, 5200, 32000, "89010004"],
+  ["Mango juice · 250 ml", "Drinks", "piece", 3000, 2400, 40000, "89010005"],
+  ["Dishwashing bar", "Household", "piece", 4000, 3200, 20000, "89010006"],
+  ["Green vegetables", "Vegetables", "kg", 6000, 4300, 12000, "89010007"],
+  ["Potato crackers", "Snacks", "piece", 2000, 1600, 45000, "89010008"],
+].map((p, i) => ({
+  id: "sample-" + i,
+  name: p[0],
+  category: p[1],
+  unit: p[2],
+  price: p[3],
+  cost: p[4],
+  stock: p[5],
+  barcode: p[6],
+  low_stock: 5000,
+  expiry: "",
+  version: 1,
+}));
+const empty = () => ({
+  products: [],
+  sales: [],
+  pending: [],
+  shop: { ...localShop },
+});
+const key = () =>
+  selected === "local" ? "local" : `${user?.id || "signed-out"}:${selected}`;
+const shop = () =>
+  selected === "local"
+    ? state?.shop || localShop
+    : shops.find((s) => s.id === selected) || state?.shop || {};
+const canEdit = () => ["owner", "master"].includes(shop().role);
+const qty = (n) =>
+  new Intl.NumberFormat("en-BD", { maximumFractionDigits: 3 }).format(n / 1000);
+const cents = (s) => Math.round(Number(s) * 100),
+  milli = (s) => Math.round(Number(s) * 1000);
+const showError = (e) => toast(e.message || String(e));
+function toast(s) {
+  $("#toast").textContent = s;
+  $("#toast").style.display = "block";
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => ($("#toast").style.display = "none"), 6000);
 }
-function counter(){const cats=['All',...new Set(state.products.map(p=>p.category))];$('#content').innerHTML=`<div class="pos-layout"><section><div class="searchbar"><input id="search" placeholder="Search products or scan a barcode…" aria-label="Search products"><button id="scan">▥ Scan</button></div><div class="chips">${cats.map(c=>`<button data-category="${esc(c)}" class="${category===c?'selected':''}">${esc(c)}</button>`).join('')}</div><div id="products" class="products"></div>${!state.products.length?`<div class="section-card"><h2>Your shelves are ready.</h2><p class="muted">Add your first product in Stock, or explore a local sample store.</p>${selected==='local'?'<button id="samples" class="primary">Load sample products</button>':'<button data-view-stock>Add your first product</button>'}</div>`:''}</section><aside class="receipt-panel" id="receipt-panel"></aside></div><button class="mobile-receipt primary" id="jump-receipt">Receipt · ${cart.length} items ↓</button>`;
- $('#search').value=search;$('#search').oninput=e=>{search=e.target.value;productGrid();};$('#search').onkeydown=e=>{if(e.key==='Enter'){const p=state.products.find(p=>p.barcode===search.trim());if(p){add(p.id);search='';$('#search').value='';productGrid();}else toast('No matching barcode.');}};$('#scan').onclick=scan;document.querySelectorAll('[data-category]').forEach(b=>b.onclick=()=>{category=b.dataset.category;counter();});$('#samples')?.addEventListener('click',async()=>{const next={...state,products:structuredClone(seed)};await save(next);state=next;render();});$('[data-view-stock]')?.addEventListener('click',()=>{view='stock';render();});$('#jump-receipt').onclick=()=>$('#receipt-panel').scrollIntoView({behavior:'smooth'});productGrid();receipt();}
-function productGrid(){const list=state.products.filter(p=>(category==='All'||p.category===category)&&`${p.name} ${p.barcode}`.toLowerCase().includes(search.toLowerCase()));$('#products').innerHTML=list.map(p=>`<button class="product" data-product="${esc(p.id)}" ${p.stock<=0||p.expiry&&p.expiry<today()?'disabled':''}><div class="product-visual">${icons[p.category]||'📦'}</div><span class="stock-tag">${p.expiry&&p.expiry<today()?'Expired':`${qty(p.stock)} ${esc(p.unit)} left`}</span><div class="product-info"><div class="product-name">${esc(p.name)}</div><div class="product-meta">${esc(p.category)} · per ${esc(p.unit)}</div><div class="product-price">${money(p.price)}<span class="plus">+</span></div></div></button>`).join('')||(!state.products.length?'':'<p class="muted">No products match your search.</p>');document.querySelectorAll('[data-product]').forEach(b=>b.onclick=()=>add(b.dataset.product));}
-function add(id){const p=state.products.find(p=>p.id===id);if(!p)return;const l=cart.find(l=>l.product_id===id),amount=p.unit==='kg'||p.unit==='litre'?500:1000;if((l?.qty||0)+amount>p.stock)return toast('Not enough stock.');if(p.expiry&&p.expiry<today())return toast('This item has expired.');if(l)l.qty+=amount;else cart.push({product_id:id,name:p.name,qty:amount,price:p.price});receipt();$('#jump-receipt').textContent=`Receipt · ${cart.length} items ↓`;}
-function receipt(){const t=totals(cart);$('#receipt-panel').innerHTML=`<div class="receipt-heading"><h2>Current receipt</h2><small>${String(cart.length).padStart(2,'0')} items</small></div><div class="receipt-paper"><div class="receipt-brand">${esc(shop().name)}</div><div class="receipt-sub">${esc(shop().address||'Your neighbourhood store')}<br>${esc(shop().phone)}</div><hr class="receipt-rule"><div class="receipt-row"><span>${today()}</span><span>NEW SALE</span></div><hr class="receipt-rule">${cart.length?cart.map(l=>`<div class="receipt-row"><div class="item-name">${esc(l.name)}<br><small>${qty(l.qty)} × ${money(l.price)}</small><br><button data-qty="${esc(l.product_id)}">Edit qty</button><button data-remove="${esc(l.product_id)}" aria-label="Remove ${esc(l.name)}">×</button></div><strong>${money(lineTotal(l.price,l.qty))}</strong></div>`).join(''):'<div class="empty-cart">Your next sale starts here.<br>Add something from the shelves.</div>'}<hr class="receipt-rule"><div class="receipt-row"><span>SUBTOTAL</span><strong>${money(t.subtotal)}</strong></div><div class="receipt-sub">Thank you for shopping local.</div></div><div class="two"><label>Discount (৳)<input id="discount" type="number" min="0" step="0.01" value="0"></label><label>Payment<select id="payment"><option>Cash</option><option>Card</option><option>Mobile</option></select></label></div><label>Amount received (৳)<input id="tendered" type="number" min="0" step="0.01" value="${t.total/100}"></label><div class="checkout-total"><span>Total to pay</span><strong id="pay-total">${money(t.total)}</strong></div><div class="receipt-row" style="font-size:12px"><span>Change</span><strong id="change">${money(0)}</strong></div><button id="checkout" class="primary checkout" ${!cart.length||busy?'disabled':''}>Complete sale →</button><p class="receipt-note">${selected==='local'?'Saved locally on this device':'Saved on device first · then synced to your shop'}</p>`;
- const calc=()=>{try{const total=totals(cart,cents($('#discount').value)).total;$('#pay-total').textContent=money(total);$('#change').textContent=money(Math.max(0,cents($('#tendered').value)-total));}catch{$('#pay-total').textContent='Check discount';}};$('#discount').oninput=()=>{try{$('#tendered').value=totals(cart,cents($('#discount').value)).total/100;}catch{}calc();};$('#tendered').oninput=calc;$('#payment').onchange=()=>{if($('#payment').value!=='Cash'){$('#tendered').value=totals(cart,cents($('#discount').value)).total/100;calc();}};
- document.querySelectorAll('[data-remove]').forEach(b=>b.onclick=()=>{cart=cart.filter(l=>l.product_id!==b.dataset.remove);receipt();});document.querySelectorAll('[data-qty]').forEach(b=>b.onclick=()=>{const l=cart.find(l=>l.product_id===b.dataset.qty);modal(`<h2>Quantity · ${esc(l.name)}</h2><form id="qty-form"><label>Quantity<input type="number" id="qty" step="0.001" min="0.001" required value="${l.qty/1000}"></label><button class="primary">Update quantity</button></form>`);$('#qty-form').onsubmit=e=>{e.preventDefault();try{const n=milli($('#qty').value);integer(n,1);if(n>state.products.find(p=>p.id===l.product_id).stock)throw Error('Not enough stock');l.qty=n;closeModal();receipt();}catch(e){showError(e);}};});$('#checkout').onclick=checkout;}
-async function checkout(){if(busy||syncing)return toast('Please wait for synchronization to finish.');busy=true;$('#checkout').disabled=true;try{const lines=validateCart(cart,state.products),t=totals(lines,cents($('#discount').value)),tendered=cents($('#tendered').value);integer(tendered,t.total);const sale={id:crypto.randomUUID(),shop_id:selected,created_at:new Date().toISOString(),payment:$('#payment').value,...t,tendered,lines,local:true};const next=structuredClone(state);for(const l of lines)next.products.find(p=>p.id===l.product_id).stock-=l.qty;next.sales.unshift(sale);if(selected!=='local')next.pending.push(sale);await save(next);state=next;cart=[];render();await showReceipt(sale);if(selected!=='local')sync().catch(showError);}catch(e){showError(e);if(view==='counter')receipt();}finally{busy=false;if($('#checkout')&&cart.length)$('#checkout').disabled=false;}}
-async function showReceipt(sale){let lines=sale.lines;if(!lines&&selected!=='local'){try{lines=(await api(`/api/shops/${selected}/sales/${sale.id}`)).lines;}catch(e){return showError(e);}}lines=lines||[];modal(`<div class="receipt-paper"><div class="receipt-brand">${esc(shop().name)}</div><div class="receipt-sub">${esc(shop().address)}<br>${esc(shop().phone)}<br>RECEIPT ${esc(sale.id.slice(0,8).toUpperCase())}<br>${esc(new Date(sale.created_at).toLocaleString('en-GB',{timeZone:'Asia/Dhaka'}))}</div><hr class="receipt-rule">${lines.map(l=>`<div class="receipt-row"><span>${esc(l.name)}<br>${qty(l.qty)} × ${money(l.price)}</span><strong>${money(lineTotal(l.price,l.qty))}</strong></div>`).join('')}<hr class="receipt-rule"><div class="receipt-row"><span>Subtotal</span><span>${money(sale.subtotal)}</span></div><div class="receipt-row"><span>Discount</span><span>${money(sale.discount)}</span></div><div class="receipt-row receipt-total"><span>TOTAL</span><span>${money(sale.total)}</span></div><div class="receipt-row"><span>${esc(sale.payment)} received</span><span>${money(sale.tendered)}</span></div><div class="receipt-row"><span>Change</span><span>${money(sale.tendered-sale.total)}</span></div><hr class="receipt-rule"><div class="receipt-sub">Thank you. See you again!<br>Powered by KhuM PoS</div></div><div class="no-print inline"><button id="print-receipt" class="primary">Print / Save PDF</button><button id="download-receipt">Save receipt</button></div>`);$('#print-receipt').onclick=()=>{if(native)return toast('Save the receipt, then open it in a browser to print. Native Bluetooth printing is planned.');window.print();};$('#download-receipt').onclick=()=>download(`KhuM-receipt-${sale.id.slice(0,8)}.html`,`<!doctype html><meta charset="utf-8"><title>KhuM PoS receipt</title><style>body{max-width:320px;margin:25px auto;font:13px monospace}.receipt-row{display:flex;justify-content:space-between;margin:12px 0}.receipt-sub,.receipt-brand{text-align:center}small{font-size:11px}</style>${$('#modal-body .receipt-paper').outerHTML}`,'text/html');}
-async function sync(){if(syncing)return;if(selected==='local')return toast('This workspace is local. Sign in to use a cloud shop.');if(!navigator.onLine)throw Error('Offline. Sales remain saved here until you reconnect.');if(!auth)throw Error('Sign in to sync.');syncing=true;$('#shop-select').disabled=true;const workspace=key();try{for(const pending of [...state.pending]){if(key()!==workspace)break;try{await api(`/api/shops/${selected}/sales`,{method:'POST',body:JSON.stringify(pending)});const next=structuredClone(state);next.pending=next.pending.filter(p=>p.id!==pending.id);await save(next);state=next;}catch(e){const next=structuredClone(state),p=next.pending.find(p=>p.id===pending.id);if(p)p.error=e.message;await save(next);state=next;throw e;}}if(key()===workspace&&!state.pending.length)await refresh();toast('Shop synchronized.');}finally{syncing=false;render();}}
-function stock(){const list=state.products;$('#content').innerHTML=`<section class="section-card"><div class="section-title"><h2>Product inventory <small>(${list.length})</small></h2>${canEdit()?'<button class="primary" id="new-product">+ Add product</button>':'<span class="badge">Cashier · read only</span>'}</div><div class="table-wrap"><table><thead><tr><th>Product</th><th>Barcode</th><th>Price</th><th>In stock</th><th>Status</th><th></th></tr></thead><tbody>${list.map(p=>`<tr><td><strong>${esc(p.name)}</strong><br><small>${esc(p.category)} · ${esc(p.unit)}</small></td><td>${esc(p.barcode||'—')}</td><td>${money(p.price)}</td><td>${qty(p.stock)}</td><td><span class="badge ${p.stock<=p.low_stock||p.expiry&&p.expiry<today()?'warn':''}">${p.expiry&&p.expiry<today()?'Expired':p.stock<=p.low_stock?'Low stock':'In stock'}</span>${p.expiry?`<br><small>Expiry: ${esc(p.expiry)}</small>`:''}</td><td>${canEdit()?`<button data-edit="${esc(p.id)}">Edit</button>`:''}</td></tr>`).join('')||'<tr><td colspan="6">No products yet. Add your first product.</td></tr>'}</tbody></table></div></section>`;$('#new-product')?.addEventListener('click',()=>productForm());document.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>productForm(list.find(p=>p.id===b.dataset.edit)));}
-function productForm(p){if(state.pending.length)return toast('Sync pending sales before editing stock.');p=p||{id:'',name:'',category:'Other',unit:'piece',barcode:'',price:0,cost:0,stock:0,low_stock:5000,expiry:''};modal(`<h2>${p.id?'Edit product':'A new addition.'}</h2><form id="product-form"><label>Product name<input name="name" required maxlength="120" value="${esc(p.name)}"></label><div class="two"><label>Category<select name="category">${Object.keys(icons).map(c=>`<option ${c===p.category?'selected':''}>${c}</option>`).join('')}</select></label><label>Unit<select name="unit">${['piece','kg','litre','pack','box'].map(c=>`<option ${c===p.unit?'selected':''}>${c}</option>`).join('')}</select></label><label>Sale price (৳)<input name="price" type="number" min="0" max="10000000" step="0.01" required value="${p.price/100}"></label><label>Cost price (৳)<input name="cost" type="number" min="0" max="10000000" step="0.01" required value="${p.cost/100}"></label><label>Stock quantity<input name="stock" type="number" min="0" max="1000000" step="0.001" required value="${p.stock/1000}"></label><label>Low-stock threshold<input name="low_stock" type="number" min="0" max="1000000" step="0.001" required value="${p.low_stock/1000}"></label><label>Barcode<input name="barcode" maxlength="80" value="${esc(p.barcode)}"></label><label>Expiry (optional)<input name="expiry" type="date" value="${esc(p.expiry)}"></label></div><small>One stock record per product. Use separate products for batches with different expiry dates in this version.</small><p><button class="primary">Save product</button></p></form>`);$('#product-form').onsubmit=async e=>{e.preventDefault();const button=e.submitter;button.disabled=true;try{const f=Object.fromEntries(new FormData(e.target)),item={...f,id:p.id||crypto.randomUUID(),price:cents(f.price),cost:cents(f.cost),stock:milli(f.stock),low_stock:milli(f.low_stock)};for(const n of ['price','cost','stock','low_stock'])integer(item[n]);if(item.barcode&&state.products.some(x=>x.id!==item.id&&x.barcode===item.barcode))throw Error('Barcode already belongs to another product.');if(selected==='local'){const next=structuredClone(state),i=next.products.findIndex(x=>x.id===item.id);if(i>=0)next.products[i]=item;else next.products.push(item);await save(next);state=next;}else{await api(`/api/shops/${selected}/products`,{method:'POST',body:JSON.stringify({...item,...(p.version?{version:p.version}:{})})});await refresh();}cart=[];closeModal();render();toast('Product saved.');}catch(e){showError(e);}finally{button.disabled=false;}};}
-function sales(){const day=today(),daily=state.sales.filter(s=>new Date(s.created_at).toLocaleDateString('en-CA',{timeZone:'Asia/Dhaka'})===day);$('#content').innerHTML=`<div class="three" style="margin-bottom:20px"><div class="stat"><small>Today’s recorded sales</small><strong>${money(daily.reduce((s,x)=>s+x.total,0))}</strong></div><div class="stat"><small>Today’s receipts</small><strong>${daily.length}</strong></div><div class="stat"><small>Awaiting cloud sync</small><strong>${state.pending.length}</strong></div></div>${state.pending.length?`<section class="section-card"><h2>Pending sales</h2><p class="muted">Saved locally and already deducted from this device’s stock. Review errors before retrying.</p>${state.pending.map(p=>`<p><strong>${esc(p.id.slice(0,8))}</strong> · ${money(p.total)}<br><small class="error">${esc(p.error||'Waiting for connection')}</small></p>`).join('')}<button id="retry-sync">Retry sync</button><p><small>Conflicts are kept for review; no sale is silently deleted or counted twice. Export a backup before changing devices.</small></p></section>`:''}<section class="section-card"><div class="section-title"><h2>Sales history</h2><button id="export-sales">Export CSV</button></div><div class="table-wrap"><table><thead><tr><th>Receipt</th><th>Date · Dhaka</th><th>Payment</th><th>Total</th><th>Status</th><th></th></tr></thead><tbody>${state.sales.map(s=>`<tr><td>${esc(s.id.slice(0,8))}</td><td>${esc(new Date(s.created_at).toLocaleString('en-GB',{timeZone:'Asia/Dhaka'}))}</td><td>${esc(s.payment)}</td><td>${money(s.total)}</td><td>${selected==='local'?'Local':state.pending.some(p=>p.id===s.id)?'Pending':'Synced'}</td><td><button data-receipt="${esc(s.id)}">Receipt</button></td></tr>`).join('')||'<tr><td colspan="6">Your first completed sale will appear here.</td></tr>'}</tbody></table></div></section>`;$('#retry-sync')?.addEventListener('click',()=>sync().catch(showError));document.querySelectorAll('[data-receipt]').forEach(b=>b.onclick=()=>showReceipt(state.sales.find(s=>s.id===b.dataset.receipt)));$('#export-sales').onclick=()=>{const cell=x=>'"'+String(x).replaceAll('"','""').replace(/^[=+@-]/,"'$&")+'"';download('KhuM-sales.csv','\uFEFF'+[['Receipt','Date','Payment','Total BDT','Discount BDT'],...state.sales.map(s=>[s.id,s.created_at,s.payment,s.total/100,s.discount/100])].map(row=>row.map(cell).join(',')).join('\r\n'),'text/csv');};}
-async function download(name,content,type='application/json'){try{if(native){const file=await Filesystem.writeFile({path:name,data:content,directory:Directory.Cache,encoding:Encoding.UTF8});await Share.share({title:name,url:file.uri});return;}const a=document.createElement('a'),url=URL.createObjectURL(new Blob([content],{type}));a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),10000);}catch(e){showError(Error('Export did not complete. Please try again.'));}}
-function settings(){$('#content').innerHTML=`<div class="two"><section class="section-card"><h2>Shop identity</h2><form id="shop-form"><label>Shop name<input name="name" required maxlength="120" value="${esc(shop().name)}" ${canEdit()?'':'disabled'}></label><label>Address<input name="address" maxlength="200" value="${esc(shop().address)}" ${canEdit()?'':'disabled'}></label><label>Phone<input name="phone" maxlength="30" value="${esc(shop().phone)}" ${canEdit()?'':'disabled'}></label>${canEdit()?'<button class="primary">Save shop details</button>':''}</form></section><section class="section-card"><h2>Your data, kept safe.</h2><p class="muted">Export this workspace’s products, receipts and pending sales. Keep the file private.</p><button id="backup">Export backup</button>${selected==='local'?'<p><label>Restore local backup<input type="file" id="restore" accept="application/json,.json"></label><small>Restore is available only into an empty local workspace. Cloud shops are restored through the central database, not by replacing shared stock.</small></p>':''}<hr class="receipt-rule"><h3>Cloud connection</h3><p class="muted">${user?`Signed in as ${esc(user.email)}`:'Sign in with Google to create or join a shop.'}</p><button id="account-settings">${user?'Manage account':'Connect Google'}</button><p><small>All synced shop records are stored on the platform owner’s Cloudflare account and can be accessed by the Master Super Admin.</small></p></section></div>${selected!=='local'&&canEdit()?'<section class="section-card"><h2>Your team</h2><div id="members">Loading team…</div><form id="invite-form" class="inline"><input name="email" type="email" placeholder="Cashier’s Google email" required aria-label="Cashier email"><button class="primary">Add cashier</button></form><p><small>Cashiers can sell and view shop sales. Only owners and the master administrator can change stock and manage the team.</small></p></section>':''}<section class="section-card"><h2>About this first version</h2><p class="muted">Sales counter, inventory, expiry blocking, receipts, offline sales, Google login, shop isolation and master administration are included. Supplier purchases, customer dues, returns, automated Drive backup, Bengali translation and native Bluetooth printing are planned additions.</p></section>`;
- $('#shop-form').onsubmit=async e=>{e.preventDefault();try{const f=Object.fromEntries(new FormData(e.target));if(selected==='local'){const next={...state,shop:{...state.shop,...f}};await save(next);state=next;}else{await api(`/api/shops/${selected}/settings`,{method:'POST',body:JSON.stringify(f)});await loadMe();await refresh();}render();toast('Shop details saved.');}catch(e){showError(e);}};
- $('#backup').onclick=()=>download(`KhuM-PoS-backup-${today()}.json`,JSON.stringify({format:'khum-pos-v1',exported_at:new Date().toISOString(),workspace:selected,...state},null,2));$('#account-settings').onclick=account;
- $('#restore')?.addEventListener('change',async e=>{try{if(state.products.length||state.sales.length)throw Error('Restore needs an empty local workspace. Export existing data first.');const file=e.target.files[0];if(!file)return;if(file.size>10000000)throw Error('Backup is too large.');const data=JSON.parse(await file.text());validateBackup(data);const next={products:data.products,sales:data.sales,pending:[],shop:{...data.shop,id:'local',role:'owner'}};await save(next);state=next;render();toast('Backup restored into the local workspace.');}catch(e){showError(e);}});
- if($('#members'))loadMembers().catch(showError);$('#invite-form')?.addEventListener('submit',async e=>{e.preventDefault();try{await api(`/api/shops/${selected}/members`,{method:'POST',body:JSON.stringify(Object.fromEntries(new FormData(e.target)))});e.target.reset();await loadMembers();toast('Cashier access saved. They can now sign in.');}catch(e){showError(e);}});}
-function validateBackup(b){if(b.format!=='khum-pos-v1'||!Array.isArray(b.products)||!Array.isArray(b.sales)||typeof b.shop?.name!=='string')throw Error('Invalid backup format');if(b.pending?.length)throw Error('This backup contains pending cloud sales. Sync those from the original device; do not restore them as new sales.');const ids=new Set();for(const p of b.products){if(typeof p.id!=='string'||ids.has(p.id)||typeof p.name!=='string'||typeof p.category!=='string'||typeof p.unit!=='string'||typeof p.expiry!=='string')throw Error('Invalid backup product');ids.add(p.id);for(const k of ['price','cost','stock','low_stock'])integer(p[k]);}for(const s of b.sales){if(typeof s.id!=='string'||!Number.isFinite(Date.parse(s.created_at)))throw Error('Invalid receipt');for(const k of ['total','discount','subtotal','tendered'])integer(s[k]);if(s.total!==s.subtotal-s.discount)throw Error('Invalid receipt total');if(s.lines&&totals(s.lines,s.discount).total!==s.total)throw Error('Invalid receipt lines');}}
-async function loadMembers(){const m=await api(`/api/shops/${selected}/members`);if(!$('#members'))return;$('#members').innerHTML=[...m.members,...m.invites.map(x=>({...x,role:'invited'}))].map(p=>`<p class="inline"><span>${esc(p.email)} · ${esc(p.role)}</span>${p.role!=='owner'?`<button data-remove-user="${esc(p.user_id||'')}" data-email="${esc(p.email)}" class="text-button error">Remove</button>`:''}</p>`).join('');document.querySelectorAll('[data-remove-user]').forEach(b=>b.onclick=async()=>{try{await api(`/api/shops/${selected}/members`,{method:'DELETE',body:JSON.stringify({user_id:b.dataset.removeUser,email:b.dataset.email})});await loadMembers();}catch(e){showError(e);}});}
-async function account(){modal(`<h2>${user?'Your account':'Connect your store.'}</h2>${user?`<p>${esc(user.name)}<br><small>${esc(user.email)}</small></p><p>Your Google subject ID: <code>${esc(user.id)}</code></p><button id="signout">Sign out</button><hr class="receipt-rule"><h3>Create a cloud shop</h3><form id="create-shop"><label>Shop name<input name="name" required maxlength="120" placeholder="e.g. Hill View Mini Mart"></label><label class="check-label"><input type="checkbox" required name="consent">I understand that synced shop records are stored on the platform owner’s Cloudflare database and the Master Super Admin can access them.</label><button class="primary">Create shop</button></form>`:`<p class="muted">One account for your shop. Your products and sales stay separate from other shops.</p>${native?'<label>Cloudflare app address<input id="api-url" type="url" placeholder="https://your-app.workers.dev" value="'+esc(apiBase)+'"></label><button class="primary" id="device-login">Sign in in browser</button>':'<div id="google-button"></div><p id="login-status" class="muted">Loading Google sign-in…</p>'}`}<div id="device-link"></div>`);
- $('#signout')?.addEventListener('click',async()=>{if(syncing)return toast('Please wait for synchronization.');if(state.pending.length)return toast('Sync or export your pending sales before signing out.');try{await api('/api/auth/logout',{method:'POST'});}catch(e){return showError(e);}auth='';localStorage.removeItem('khum-session');user=null;shops=[];selected='local';await loadWorkspace();closeModal();render();});
- $('#create-shop')?.addEventListener('submit',async e=>{e.preventDefault();const btn=e.submitter;btn.disabled=true;try{if(syncing)throw Error('Please wait for synchronization.');const f=new FormData(e.target),s=await api('/api/shops',{method:'POST',body:JSON.stringify({name:f.get('name'),consent:true})});await loadMe();selected=s.id;localStorage.setItem('khum-shop',selected);await loadWorkspace();await refresh();closeModal();toast('Cloud shop created. Add products in Stock.');}catch(e){showError(e);}finally{btn.disabled=false;}});
- if(!user&&!native)googleLogin().catch(showError);$('#device-login')?.addEventListener('click',deviceLogin);
- const linkCode=new URL(location.href).searchParams.get('link');if(user&&linkCode){$('#device-link').innerHTML=`<hr class="receipt-rule"><h3>Link an Android device</h3><p>Only approve this if you just started sign-in on your own KhuM PoS Android app and its code matches:</p><h2>${esc(linkCode)}</h2><button id="approve-device" class="primary">Approve this device</button>`;$('#approve-device').onclick=async()=>{try{await api('/api/auth/device/approve',{method:'POST',body:JSON.stringify({code:linkCode})});$('#device-link').textContent='Device approved. Return to the KhuM PoS app.';history.replaceState({},'',location.pathname);}catch(e){showError(e);}};}}
-async function googleLogin(){config=await api('/api/config');if(!config.googleClientId){$('#login-status').textContent='Google sign-in is not configured yet. Follow docs/DEPLOYMENT.md in the repository.';return;}if(!window.google){await new Promise((resolve,reject)=>{const s=document.createElement('script');s.src='https://accounts.google.com/gsi/client';s.onload=resolve;s.onerror=()=>reject(Error('Could not load Google sign-in. Check your connection.'));document.head.appendChild(s);});}google.accounts.id.initialize({client_id:config.googleClientId,callback:async r=>{try{const result=await api('/api/auth/google',{method:'POST',body:JSON.stringify({credential:r.credential})});auth=result.token;localStorage.setItem('khum-session',auth);await loadMe();await loadWorkspace();account();}catch(e){showError(e);}}});if($('#google-button')){google.accounts.id.renderButton($('#google-button'),{theme:'outline',size:'large',text:'signin_with'});$('#login-status').textContent='Use your Google account to continue.';}}
-async function deviceLogin(){try{const url=new URL($('#api-url').value);if(url.protocol!=='https:'||url.username||url.password)throw Error('Enter a secure HTTPS Cloudflare address');apiBase=url.origin;localStorage.setItem('khum-api',apiBase);pairing=await api('/api/auth/device/start',{method:'POST'});const pairingSecret=pairing.secret,deadline=Date.now()+600000;$('#device-link').innerHTML=`<p>Device code: <strong>${esc(pairing.code)}</strong></p><p>Approve the matching code in your browser. Keep this screen open.</p>`;await Browser.open({url:`${apiBase}/?link=${encodeURIComponent(pairing.code)}`});const poll=async()=>{if(!pairing||Date.now()>deadline)return;try{const result=await api('/api/auth/device/poll',{method:'POST',body:JSON.stringify({secret:pairingSecret})});if(result.token){pairing=null;auth=result.token;localStorage.setItem('khum-session',auth);await loadMe();await loadWorkspace();await Browser.close().catch(()=>{});closeModal();toast('Google account connected.');return;}}catch(e){if(e.status===410){pairing=null;return showError(e);}}setTimeout(poll,5000);};setTimeout(poll,5000);}catch(e){showError(e);}}
-async function admin(){if(!user?.master)return;$('#content').innerHTML='<p class="muted">Loading platform records…</p>';const data=await api('/api/admin');if(view!=='admin')return;$('#content').innerHTML=`<div class="notice">Master Super Admin · All central shop data is accessible here. Administrative access is recorded in the audit log.</div><div class="three" style="margin-bottom:20px"><div class="stat"><small>Shops</small><strong>${data.shops.length}</strong></div><div class="stat"><small>Cloud receipts</small><strong>${data.shops.reduce((s,x)=>s+x.sales,0)}</strong></div><div class="stat"><small>Recorded cloud revenue</small><strong>${money(data.shops.reduce((s,x)=>s+x.revenue,0))}</strong></div></div><section class="section-card"><h2>Shops</h2><div class="table-wrap"><table><thead><tr><th>Shop</th><th>Members</th><th>Sales</th><th>Revenue</th><th>Status</th><th></th></tr></thead><tbody>${data.shops.map(s=>`<tr><td>${esc(s.name)}</td><td>${s.members}</td><td>${s.sales}</td><td>${money(s.revenue)}</td><td>${s.active?'Active':'Suspended'}</td><td><button data-open-shop="${esc(s.id)}">Open shop</button> <button data-status-shop="${esc(s.id)}" data-active="${s.active}">${s.active?'Suspend':'Activate'}</button></td></tr>`).join('')||'<tr><td colspan="6">No shops registered yet.</td></tr>'}</tbody></table></div></section><section class="section-card"><h2>Recent platform activity</h2><div class="table-wrap"><table><thead><tr><th>Time</th><th>Action</th><th>Shop</th><th>Actor</th></tr></thead><tbody>${data.audit.map(a=>`<tr><td>${esc(a.created_at)}</td><td>${esc(a.action)}</td><td>${esc(a.shop_id||'Platform')}</td><td>${esc(a.actor)}</td></tr>`).join('')}</tbody></table></div></section>`;document.querySelectorAll('[data-open-shop]').forEach(b=>b.onclick=async()=>{if(syncing)return toast('Please wait for synchronization.');selected=b.dataset.openShop;localStorage.setItem('khum-shop',selected);view='counter';await loadWorkspace();await refresh();});document.querySelectorAll('[data-status-shop]').forEach(b=>b.onclick=()=>{modal(`<h2>${b.dataset.active==='1'?'Suspend':'Activate'} this shop?</h2><p>Suspending blocks cloud access for its owner and cashiers. Already cached offline sales remain on their devices until access is restored.</p><button id="confirm-status" class="primary">Confirm change</button>`);$('#confirm-status').onclick=async()=>{try{await api(`/api/shops/${b.dataset.statusShop}/status`,{method:'POST',body:JSON.stringify({active:b.dataset.active!=='1'})});await loadMe();closeModal();render();}catch(e){showError(e);}};});}
-async function scan(){if(!('BarcodeDetector'in window))return modal('<h2>Barcode entry</h2><p>Camera barcode detection is unavailable on this device. Use a USB/Bluetooth keyboard scanner in the search field, or type the barcode and press Enter.</p>');try{const supported=await BarcodeDetector.getSupportedFormats(),formats=['ean_13','ean_8','upc_a','upc_e','code_128'].filter(f=>supported.includes(f));if(!formats.length)throw Error('No supported barcode formats');const detector=new BarcodeDetector({formats});modal('<h2>Scan a product</h2><video id="camera" autoplay playsinline style="width:100%;border-radius:10px"></video><p class="muted">Point the camera at the product barcode.</p>');stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}});$('#camera').srcObject=stream;const tick=async()=>{if(!stream||!$('#modal').open)return;try{const codes=await detector.detect($('#camera'));if(codes.length){const p=state.products.find(p=>p.barcode===codes[0].rawValue);closeModal();if(p)add(p.id);else toast('Barcode not found in your stock.');return;}}catch{}requestAnimationFrame(tick);};requestAnimationFrame(tick);}catch(e){closeModal();showError(Error('Camera unavailable. Type or scan into the search field instead.'));}}
-window.addEventListener('online',()=>{if(selected!=='local'&&auth)sync().catch(showError);else render();});window.addEventListener('offline',render);
-async function init(){await openDB();await navigator.storage?.persist?.().catch(()=>{});if(!native){apiBase='';if('serviceWorker'in navigator)navigator.serviceWorker.register('/sw.js').catch(()=>{});}if(auth){try{await loadMe();}catch(e){if(e.status===401){auth='';localStorage.removeItem('khum-session');selected='local';}else{user=JSON.parse(localStorage.getItem('khum-user')||'null');shops=JSON.parse(localStorage.getItem('khum-shops')||'[]');toast('Offline account cache loaded.');}}}if(user){localStorage.setItem('khum-user',JSON.stringify(user));localStorage.setItem('khum-shops',JSON.stringify(shops));}await loadWorkspace();if(selected!=='local'&&auth&&navigator.onLine)sync().catch(showError);if(new URL(location.href).searchParams.has('link'))account();}
-init().catch(e=>{$('#app').innerHTML='<div class="workspace"><h1>KhuM PoS could not open device storage.</h1><p>Please allow browser storage or free some space, then reload.</p></div>';console.error(e);});
+async function openDB() {
+  db = await new Promise((resolve, reject) => {
+    const r = indexedDB.open("khum-pos", 1);
+    r.onupgradeneeded = () => r.result.createObjectStore("workspaces");
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+}
+function read(k) {
+  return new Promise((resolve, reject) => {
+    const r = db.transaction("workspaces").objectStore("workspaces").get(k);
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+}
+function save(value = state, k = key()) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction("workspaces", "readwrite"),
+      store = tx.objectStore("workspaces");
+    let conflict = false;
+    const request = store.get(k);
+    request.onsuccess = () => {
+      if ((request.result?.revision || 0) !== (value.revision || 0)) {
+        conflict = true;
+        tx.abort();
+        return;
+      }
+      value.revision = (value.revision || 0) + 1;
+      store.put(structuredClone(value), k);
+    };
+    tx.oncomplete = resolve;
+    tx.onerror = () =>
+      reject(
+        Error("Could not save on this device. Free storage and try again."),
+      );
+    tx.onabort = () =>
+      reject(
+        Error(
+          conflict
+            ? "Another tab changed this workspace. Reload before continuing; this action was not saved."
+            : "Device save was interrupted.",
+        ),
+      );
+  });
+}
+async function api(path, options = {}) {
+  const res = await fetch(apiBase + path, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...(auth ? { Authorization: `Bearer ${auth}` } : {}),
+      ...options.headers,
+    },
+  });
+  const data = await res.json();
+  if (!res.ok)
+    throw Object.assign(Error(data.error || "Request failed"), {
+      status: res.status,
+    });
+  return data;
+}
+async function loadWorkspace() {
+  state = (await read(key())) || empty();
+  if (selected !== "local") state.shop = { ...shop() };
+  cart = [];
+  render();
+}
+async function refresh() {
+  if (selected === "local" || !auth) return;
+  if (state.pending.length)
+    throw Error("Sync pending sales before refreshing stock.");
+  const snap = await api(`/api/shops/${selected}/snapshot`);
+  const next = {
+    ...state,
+    shop: snap.shop,
+    products: snap.products,
+    sales: snap.sales,
+  };
+  await save(next);
+  state = next;
+  render();
+}
+async function loadMe() {
+  const me = await api("/api/me");
+  user = me.user;
+  shops = me.shops;
+  localStorage.setItem("khum-user", JSON.stringify(user));
+  localStorage.setItem("khum-shops", JSON.stringify(shops));
+  if (selected !== "local" && !shops.some((s) => s.id === selected))
+    selected = shops[0]?.id || "local";
+}
+function modal(html) {
+  stopCamera();
+  $("#modal-body").innerHTML = html;
+  $("#modal").showModal();
+}
+function closeModal() {
+  stopCamera();
+  $("#modal").close();
+}
+function stopCamera() {
+  stream?.getTracks().forEach((t) => t.stop());
+  stream = null;
+}
+$("#close-modal").onclick = closeModal;
+$("#modal").addEventListener("close", stopCamera);
+const nav = [
+  ["counter", "▦", "Counter"],
+  ["stock", "▣", "Stock"],
+  ["sales", "↗", "Sales"],
+  ["settings", "⚙", "Settings"],
+];
+function render() {
+  if (!state) return;
+  const s = shop(),
+    pending = state.pending.length;
+  $("#app").innerHTML =
+    `<div class="shell"><aside class="rail"><div class="brand">K.</div>${nav.map(([id, i, t]) => `<button data-view="${id}" class="${view === id ? "active" : ""}" aria-label="${t}"><span>${i}</span>${t}</button>`).join("")}${user?.master ? `<button data-view="admin" class="${view === "admin" ? "active" : ""}"><span>♜</span>Platform</button>` : ""}<button class="bottom" data-action="account"><span>◎</span>Account</button></aside><main class="main"><header class="topbar"><div class="inline"><div class="wordmark">KhuM <b>PoS</b></div><span class="muted">/</span><select id="shop-select" class="shopselect" aria-label="Select shop"><option value="local">${esc(state.shop?.id === "local" ? state.shop.name : "Local workspace")}</option>${shops.map((x) => `<option value="${esc(x.id)}" ${selected === x.id ? "selected" : ""}>${esc(x.name)}${x.active ? "" : " · suspended"}</option>`).join("")}</select></div><div class="top-actions"><span class="badge ${pending || !navigator.onLine ? "warn" : ""}">${selected === "local" ? "LOCAL ONLY" : pending ? `${pending} pending` : navigator.onLine ? "CLOUD CONNECTED" : "OFFLINE"}</span><button class="text-button" data-action="sync">↻ Sync</button><button class="avatar" data-action="account" aria-label="Account">${esc((user?.name || "K")[0])}</button></div></header><div class="workspace"><div class="intro"><div><div class="eyebrow">${view === "counter" ? "Your everyday counter" : esc(s.name || "KhuM PoS")}</div><h1>${{ counter: "Good things, in store.", stock: "Everything on your shelves.", sales: "Every sale, accounted for.", settings: "Make it your store.", admin: "Your platform, at a glance." }[view]}</h1><p class="muted" style="font-size:13px;margin-bottom:0">${{ counter: "A little less paperwork. A little more business.", stock: "Keep prices and quantities up to date.", sales: "Local receipts and the latest 500 cloud sales.", settings: "Shop details, team access and your data.", admin: "Manage shops and review platform activity." }[view]}</p></div><span class="date muted">${new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric", timeZone: "Asia/Dhaka" })}</span></div>${selected === "local" ? '<div class="notice">Local workspace · Saved on this device only. Sign in and create a cloud shop to share stock between devices. Local sample data stays separate.</div>' : ""}${state.pending.some((p) => p.error) ? '<div class="notice">A pending sale needs attention. Open Sales to review the sync error. Keep this device’s backup until resolved.</div>' : ""}<div id="content"></div><div class="footer-note">KhuM PoS · Made for your everyday business · v0.1.0</div></div></main></div>`;
+  $("#shop-select").value = selected;
+  $("#shop-select").disabled = syncing;
+  $("#shop-select").onchange = async (e) => {
+    selected = e.target.value;
+    localStorage.setItem("khum-shop", selected);
+    await loadWorkspace();
+    if (selected !== "local")
+      try {
+        await refresh();
+      } catch (e) {
+        showError(e);
+      }
+  };
+  document.querySelectorAll("[data-view]").forEach(
+    (b) =>
+      (b.onclick = () => {
+        view = b.dataset.view;
+        render();
+      }),
+  );
+  document
+    .querySelectorAll('[data-action="account"]')
+    .forEach((b) => (b.onclick = account));
+  $('[data-action="sync"]').onclick = () => sync().catch(showError);
+  if (view === "counter") counter();
+  if (view === "stock") stock();
+  if (view === "sales") sales();
+  if (view === "settings") settings();
+  if (view === "admin") admin().catch(showError);
+}
+function counter() {
+  const cats = ["All", ...new Set(state.products.map((p) => p.category))];
+  $("#content").innerHTML =
+    `<div class="pos-layout"><section><div class="searchbar"><input id="search" placeholder="Search products or scan a barcode…" aria-label="Search products"><button id="scan">▥ Scan</button></div><div class="chips">${cats.map((c) => `<button data-category="${esc(c)}" class="${category === c ? "selected" : ""}">${esc(c)}</button>`).join("")}</div><div id="products" class="products"></div>${!state.products.length ? `<div class="section-card"><h2>Your shelves are ready.</h2><p class="muted">Add your first product in Stock, or explore a local sample store.</p>${selected === "local" ? '<button id="samples" class="primary">Load sample products</button>' : "<button data-view-stock>Add your first product</button>"}</div>` : ""}</section><aside class="receipt-panel" id="receipt-panel"></aside></div><button class="mobile-receipt primary" id="jump-receipt">Receipt · ${cart.length} items ↓</button>`;
+  $("#search").value = search;
+  $("#search").oninput = (e) => {
+    search = e.target.value;
+    productGrid();
+  };
+  $("#search").onkeydown = (e) => {
+    if (e.key === "Enter") {
+      const p = state.products.find((p) => p.barcode === search.trim());
+      if (p) {
+        add(p.id);
+        search = "";
+        $("#search").value = "";
+        productGrid();
+      } else toast("No matching barcode.");
+    }
+  };
+  $("#scan").onclick = scan;
+  document.querySelectorAll("[data-category]").forEach(
+    (b) =>
+      (b.onclick = () => {
+        category = b.dataset.category;
+        counter();
+      }),
+  );
+  $("#samples")?.addEventListener("click", async () => {
+    const next = { ...state, products: structuredClone(seed) };
+    await save(next);
+    state = next;
+    render();
+  });
+  $("[data-view-stock]")?.addEventListener("click", () => {
+    view = "stock";
+    render();
+  });
+  $("#jump-receipt").onclick = () =>
+    $("#receipt-panel").scrollIntoView({ behavior: "smooth" });
+  productGrid();
+  receipt();
+}
+function productGrid() {
+  const list = state.products.filter(
+    (p) =>
+      (category === "All" || p.category === category) &&
+      `${p.name} ${p.barcode}`.toLowerCase().includes(search.toLowerCase()),
+  );
+  $("#products").innerHTML =
+    list
+      .map(
+        (p) =>
+          `<button class="product" data-product="${esc(p.id)}" ${p.stock <= 0 || (p.expiry && p.expiry < today()) ? "disabled" : ""}><div class="product-visual">${icons[p.category] || "📦"}</div><span class="stock-tag">${p.expiry && p.expiry < today() ? "Expired" : `${qty(p.stock)} ${esc(p.unit)} left`}</span><div class="product-info"><div class="product-name">${esc(p.name)}</div><div class="product-meta">${esc(p.category)} · per ${esc(p.unit)}</div><div class="product-price">${money(p.price)}<span class="plus">+</span></div></div></button>`,
+      )
+      .join("") ||
+    (!state.products.length
+      ? ""
+      : '<p class="muted">No products match your search.</p>');
+  document
+    .querySelectorAll("[data-product]")
+    .forEach((b) => (b.onclick = () => add(b.dataset.product)));
+}
+function add(id) {
+  const p = state.products.find((p) => p.id === id);
+  if (!p) return;
+  const l = cart.find((l) => l.product_id === id),
+    amount = p.unit === "kg" || p.unit === "litre" ? 500 : 1000;
+  if ((l?.qty || 0) + amount > p.stock) return toast("Not enough stock.");
+  if (p.expiry && p.expiry < today()) return toast("This item has expired.");
+  if (l) l.qty += amount;
+  else cart.push({ product_id: id, name: p.name, qty: amount, price: p.price });
+  receipt();
+  $("#jump-receipt").textContent = `Receipt · ${cart.length} items ↓`;
+}
+function receipt() {
+  const t = totals(cart);
+  $("#receipt-panel").innerHTML =
+    `<div class="receipt-heading"><h2>Current receipt</h2><small>${String(cart.length).padStart(2, "0")} items</small></div><div class="receipt-paper"><div class="receipt-brand">${esc(shop().name)}</div><div class="receipt-sub">${esc(shop().address || "Your neighbourhood store")}<br>${esc(shop().phone)}</div><hr class="receipt-rule"><div class="receipt-row"><span>${today()}</span><span>NEW SALE</span></div><hr class="receipt-rule">${cart.length ? cart.map((l) => `<div class="receipt-row"><div class="item-name">${esc(l.name)}<br><small>${qty(l.qty)} × ${money(l.price)}</small><br><button data-qty="${esc(l.product_id)}">Edit qty</button><button data-remove="${esc(l.product_id)}" aria-label="Remove ${esc(l.name)}">×</button></div><strong>${money(lineTotal(l.price, l.qty))}</strong></div>`).join("") : '<div class="empty-cart">Your next sale starts here.<br>Add something from the shelves.</div>'}<hr class="receipt-rule"><div class="receipt-row"><span>SUBTOTAL</span><strong>${money(t.subtotal)}</strong></div><div class="receipt-sub">Thank you for shopping local.</div></div><div class="two"><label>Discount (৳)<input id="discount" type="number" min="0" step="0.01" value="0"></label><label>Payment<select id="payment"><option>Cash</option><option>Card</option><option>Mobile</option></select></label></div><label>Amount received (৳)<input id="tendered" type="number" min="0" step="0.01" value="${t.total / 100}"></label><div class="checkout-total"><span>Total to pay</span><strong id="pay-total">${money(t.total)}</strong></div><div class="receipt-row" style="font-size:12px"><span>Change</span><strong id="change">${money(0)}</strong></div><button id="checkout" class="primary checkout" ${!cart.length || busy ? "disabled" : ""}>Complete sale →</button><p class="receipt-note">${selected === "local" ? "Saved locally on this device" : "Saved on device first · then synced to your shop"}</p>`;
+  const calc = () => {
+    try {
+      const total = totals(cart, cents($("#discount").value)).total;
+      $("#pay-total").textContent = money(total);
+      $("#change").textContent = money(
+        Math.max(0, cents($("#tendered").value) - total),
+      );
+    } catch {
+      $("#pay-total").textContent = "Check discount";
+    }
+  };
+  $("#discount").oninput = () => {
+    try {
+      $("#tendered").value =
+        totals(cart, cents($("#discount").value)).total / 100;
+    } catch {}
+    calc();
+  };
+  $("#tendered").oninput = calc;
+  $("#payment").onchange = () => {
+    if ($("#payment").value !== "Cash") {
+      $("#tendered").value =
+        totals(cart, cents($("#discount").value)).total / 100;
+      calc();
+    }
+  };
+  document.querySelectorAll("[data-remove]").forEach(
+    (b) =>
+      (b.onclick = () => {
+        cart = cart.filter((l) => l.product_id !== b.dataset.remove);
+        receipt();
+      }),
+  );
+  document.querySelectorAll("[data-qty]").forEach(
+    (b) =>
+      (b.onclick = () => {
+        const l = cart.find((l) => l.product_id === b.dataset.qty);
+        modal(
+          `<h2>Quantity · ${esc(l.name)}</h2><form id="qty-form"><label>Quantity<input type="number" id="qty" step="0.001" min="0.001" required value="${l.qty / 1000}"></label><button class="primary">Update quantity</button></form>`,
+        );
+        $("#qty-form").onsubmit = (e) => {
+          e.preventDefault();
+          try {
+            const n = milli($("#qty").value);
+            integer(n, 1);
+            if (n > state.products.find((p) => p.id === l.product_id).stock)
+              throw Error("Not enough stock");
+            l.qty = n;
+            closeModal();
+            receipt();
+          } catch (e) {
+            showError(e);
+          }
+        };
+      }),
+  );
+  $("#checkout").onclick = checkout;
+}
+async function checkout() {
+  if (busy || syncing)
+    return toast("Please wait for synchronization to finish.");
+  busy = true;
+  $("#checkout").disabled = true;
+  try {
+    const lines = validateCart(cart, state.products),
+      t = totals(lines, cents($("#discount").value)),
+      tendered = cents($("#tendered").value);
+    integer(tendered, t.total);
+    const sale = {
+      id: crypto.randomUUID(),
+      shop_id: selected,
+      created_at: new Date().toISOString(),
+      payment: $("#payment").value,
+      ...t,
+      tendered,
+      lines,
+      local: true,
+    };
+    const next = structuredClone(state);
+    for (const l of lines)
+      next.products.find((p) => p.id === l.product_id).stock -= l.qty;
+    next.sales.unshift(sale);
+    if (selected !== "local") next.pending.push(sale);
+    await save(next);
+    state = next;
+    cart = [];
+    render();
+    await showReceipt(sale);
+    if (selected !== "local") sync().catch(showError);
+  } catch (e) {
+    showError(e);
+    if (view === "counter") receipt();
+  } finally {
+    busy = false;
+    if ($("#checkout") && cart.length) $("#checkout").disabled = false;
+  }
+}
+async function showReceipt(sale) {
+  let lines = sale.lines;
+  if (!lines && selected !== "local") {
+    try {
+      lines = (await api(`/api/shops/${selected}/sales/${sale.id}`)).lines;
+    } catch (e) {
+      return showError(e);
+    }
+  }
+  lines = lines || [];
+  modal(
+    `<div class="receipt-paper"><div class="receipt-brand">${esc(shop().name)}</div><div class="receipt-sub">${esc(shop().address)}<br>${esc(shop().phone)}<br>RECEIPT ${esc(sale.id.slice(0, 8).toUpperCase())}<br>${esc(new Date(sale.created_at).toLocaleString("en-GB", { timeZone: "Asia/Dhaka" }))}</div><hr class="receipt-rule">${lines.map((l) => `<div class="receipt-row"><span>${esc(l.name)}<br>${qty(l.qty)} × ${money(l.price)}</span><strong>${money(lineTotal(l.price, l.qty))}</strong></div>`).join("")}<hr class="receipt-rule"><div class="receipt-row"><span>Subtotal</span><span>${money(sale.subtotal)}</span></div><div class="receipt-row"><span>Discount</span><span>${money(sale.discount)}</span></div><div class="receipt-row receipt-total"><span>TOTAL</span><span>${money(sale.total)}</span></div><div class="receipt-row"><span>${esc(sale.payment)} received</span><span>${money(sale.tendered)}</span></div><div class="receipt-row"><span>Change</span><span>${money(sale.tendered - sale.total)}</span></div><hr class="receipt-rule"><div class="receipt-sub">Thank you. See you again!<br>Powered by KhuM PoS</div></div><div class="no-print inline"><button id="print-receipt" class="primary">Print / Save PDF</button><button id="download-receipt">Save receipt</button></div>`,
+  );
+  $("#print-receipt").onclick = () => {
+    if (native)
+      return toast(
+        "Save the receipt, then open it in a browser to print. Native Bluetooth printing is planned.",
+      );
+    window.print();
+  };
+  $("#download-receipt").onclick = () =>
+    download(
+      `KhuM-receipt-${sale.id.slice(0, 8)}.html`,
+      `<!doctype html><meta charset="utf-8"><title>KhuM PoS receipt</title><style>body{max-width:320px;margin:25px auto;font:13px monospace}.receipt-row{display:flex;justify-content:space-between;margin:12px 0}.receipt-sub,.receipt-brand{text-align:center}small{font-size:11px}</style>${$("#modal-body .receipt-paper").outerHTML}`,
+      "text/html",
+    );
+}
+async function sync() {
+  if (syncing) return;
+  if (selected === "local")
+    return toast("This workspace is local. Sign in to use a cloud shop.");
+  if (!navigator.onLine)
+    throw Error("Offline. Sales remain saved here until you reconnect.");
+  if (!auth) throw Error("Sign in to sync.");
+  syncing = true;
+  $("#shop-select").disabled = true;
+  const workspace = key();
+  try {
+    for (const pending of [...state.pending]) {
+      if (key() !== workspace) break;
+      try {
+        await api(`/api/shops/${selected}/sales`, {
+          method: "POST",
+          body: JSON.stringify(pending),
+        });
+        const next = structuredClone(state);
+        next.pending = next.pending.filter((p) => p.id !== pending.id);
+        await save(next);
+        state = next;
+      } catch (e) {
+        const next = structuredClone(state),
+          p = next.pending.find((p) => p.id === pending.id);
+        if (p) p.error = e.message;
+        await save(next);
+        state = next;
+        throw e;
+      }
+    }
+    if (key() === workspace && !state.pending.length) await refresh();
+    toast("Shop synchronized.");
+  } finally {
+    syncing = false;
+    render();
+  }
+}
+function stock() {
+  const list = state.products;
+  $("#content").innerHTML =
+    `<section class="section-card"><div class="section-title"><h2>Product inventory <small>(${list.length})</small></h2>${canEdit() ? '<button class="primary" id="new-product">+ Add product</button>' : '<span class="badge">Cashier · read only</span>'}</div><div class="table-wrap"><table><thead><tr><th>Product</th><th>Barcode</th><th>Price</th><th>In stock</th><th>Status</th><th></th></tr></thead><tbody>${list.map((p) => `<tr><td><strong>${esc(p.name)}</strong><br><small>${esc(p.category)} · ${esc(p.unit)}</small></td><td>${esc(p.barcode || "—")}</td><td>${money(p.price)}</td><td>${qty(p.stock)}</td><td><span class="badge ${p.stock <= p.low_stock || (p.expiry && p.expiry < today()) ? "warn" : ""}">${p.expiry && p.expiry < today() ? "Expired" : p.stock <= p.low_stock ? "Low stock" : "In stock"}</span>${p.expiry ? `<br><small>Expiry: ${esc(p.expiry)}</small>` : ""}</td><td>${canEdit() ? `<button data-edit="${esc(p.id)}">Edit</button>` : ""}</td></tr>`).join("") || '<tr><td colspan="6">No products yet. Add your first product.</td></tr>'}</tbody></table></div></section>`;
+  $("#new-product")?.addEventListener("click", () => productForm());
+  document
+    .querySelectorAll("[data-edit]")
+    .forEach(
+      (b) =>
+        (b.onclick = () =>
+          productForm(list.find((p) => p.id === b.dataset.edit))),
+    );
+}
+function productForm(p) {
+  if (state.pending.length)
+    return toast("Sync pending sales before editing stock.");
+  p = p || {
+    id: "",
+    name: "",
+    category: "Other",
+    unit: "piece",
+    barcode: "",
+    price: 0,
+    cost: 0,
+    stock: 0,
+    low_stock: 5000,
+    expiry: "",
+  };
+  modal(
+    `<h2>${p.id ? "Edit product" : "A new addition."}</h2><form id="product-form"><label>Product name<input name="name" required maxlength="120" value="${esc(p.name)}"></label><div class="two"><label>Category<select name="category">${Object.keys(
+      icons,
+    )
+      .map((c) => `<option ${c === p.category ? "selected" : ""}>${c}</option>`)
+      .join(
+        "",
+      )}</select></label><label>Unit<select name="unit">${["piece", "kg", "litre", "pack", "box"].map((c) => `<option ${c === p.unit ? "selected" : ""}>${c}</option>`).join("")}</select></label><label>Sale price (৳)<input name="price" type="number" min="0" max="10000000" step="0.01" required value="${p.price / 100}"></label><label>Cost price (৳)<input name="cost" type="number" min="0" max="10000000" step="0.01" required value="${p.cost / 100}"></label><label>Stock quantity<input name="stock" type="number" min="0" max="1000000" step="0.001" required value="${p.stock / 1000}"></label><label>Low-stock threshold<input name="low_stock" type="number" min="0" max="1000000" step="0.001" required value="${p.low_stock / 1000}"></label><label>Barcode<input name="barcode" maxlength="80" value="${esc(p.barcode)}"></label><label>Expiry (optional)<input name="expiry" type="date" value="${esc(p.expiry)}"></label></div><small>One stock record per product. Use separate products for batches with different expiry dates in this version.</small><p><button class="primary">Save product</button></p></form>`,
+  );
+  $("#product-form").onsubmit = async (e) => {
+    e.preventDefault();
+    const button = e.submitter;
+    button.disabled = true;
+    try {
+      const f = Object.fromEntries(new FormData(e.target)),
+        item = {
+          ...f,
+          id: p.id || crypto.randomUUID(),
+          price: cents(f.price),
+          cost: cents(f.cost),
+          stock: milli(f.stock),
+          low_stock: milli(f.low_stock),
+        };
+      for (const n of ["price", "cost", "stock", "low_stock"]) integer(item[n]);
+      if (
+        item.barcode &&
+        state.products.some(
+          (x) => x.id !== item.id && x.barcode === item.barcode,
+        )
+      )
+        throw Error("Barcode already belongs to another product.");
+      if (selected === "local") {
+        const next = structuredClone(state),
+          i = next.products.findIndex((x) => x.id === item.id);
+        if (i >= 0) next.products[i] = item;
+        else next.products.push(item);
+        await save(next);
+        state = next;
+      } else {
+        await api(`/api/shops/${selected}/products`, {
+          method: "POST",
+          body: JSON.stringify({
+            ...item,
+            ...(p.version ? { version: p.version } : {}),
+          }),
+        });
+        await refresh();
+      }
+      cart = [];
+      closeModal();
+      render();
+      toast("Product saved.");
+    } catch (e) {
+      showError(e);
+    } finally {
+      button.disabled = false;
+    }
+  };
+}
+function sales() {
+  const day = today(),
+    daily = state.sales.filter(
+      (s) =>
+        new Date(s.created_at).toLocaleDateString("en-CA", {
+          timeZone: "Asia/Dhaka",
+        }) === day,
+    );
+  $("#content").innerHTML =
+    `<div class="three" style="margin-bottom:20px"><div class="stat"><small>Today’s recorded sales</small><strong>${money(daily.reduce((s, x) => s + x.total, 0))}</strong></div><div class="stat"><small>Today’s receipts</small><strong>${daily.length}</strong></div><div class="stat"><small>Awaiting cloud sync</small><strong>${state.pending.length}</strong></div></div>${state.pending.length ? `<section class="section-card"><h2>Pending sales</h2><p class="muted">Saved locally and already deducted from this device’s stock. Review errors before retrying.</p>${state.pending.map((p) => `<p><strong>${esc(p.id.slice(0, 8))}</strong> · ${money(p.total)}<br><small class="error">${esc(p.error || "Waiting for connection")}</small></p>`).join("")}<button id="retry-sync">Retry sync</button><p><small>Conflicts are kept for review; no sale is silently deleted or counted twice. Export a backup before changing devices.</small></p></section>` : ""}<section class="section-card"><div class="section-title"><h2>Sales history</h2><button id="export-sales">Export CSV</button></div><div class="table-wrap"><table><thead><tr><th>Receipt</th><th>Date · Dhaka</th><th>Payment</th><th>Total</th><th>Status</th><th></th></tr></thead><tbody>${state.sales.map((s) => `<tr><td>${esc(s.id.slice(0, 8))}</td><td>${esc(new Date(s.created_at).toLocaleString("en-GB", { timeZone: "Asia/Dhaka" }))}</td><td>${esc(s.payment)}</td><td>${money(s.total)}</td><td>${selected === "local" ? "Local" : state.pending.some((p) => p.id === s.id) ? "Pending" : "Synced"}</td><td><button data-receipt="${esc(s.id)}">Receipt</button></td></tr>`).join("") || '<tr><td colspan="6">Your first completed sale will appear here.</td></tr>'}</tbody></table></div></section>`;
+  $("#retry-sync")?.addEventListener("click", () => sync().catch(showError));
+  document
+    .querySelectorAll("[data-receipt]")
+    .forEach(
+      (b) =>
+        (b.onclick = () =>
+          showReceipt(state.sales.find((s) => s.id === b.dataset.receipt))),
+    );
+  $("#export-sales").onclick = () => {
+    const cell = (x) =>
+      '"' +
+      String(x)
+        .replaceAll('"', '""')
+        .replace(/^[=+@-]/, "'$&") +
+      '"';
+    download(
+      "KhuM-sales.csv",
+      "\uFEFF" +
+        [
+          ["Receipt", "Date", "Payment", "Total BDT", "Discount BDT"],
+          ...state.sales.map((s) => [
+            s.id,
+            s.created_at,
+            s.payment,
+            s.total / 100,
+            s.discount / 100,
+          ]),
+        ]
+          .map((row) => row.map(cell).join(","))
+          .join("\r\n"),
+      "text/csv",
+    );
+  };
+}
+async function download(name, content, type = "application/json") {
+  try {
+    if (native) {
+      const file = await Filesystem.writeFile({
+        path: name,
+        data: content,
+        directory: Directory.Cache,
+        encoding: Encoding.UTF8,
+      });
+      await Share.share({ title: name, url: file.uri });
+      return;
+    }
+    const a = document.createElement("a"),
+      url = URL.createObjectURL(new Blob([content], { type }));
+    a.href = url;
+    a.download = name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  } catch (e) {
+    showError(Error("Export did not complete. Please try again."));
+  }
+}
+function settings() {
+  $("#content").innerHTML =
+    `<div class="two"><section class="section-card"><h2>Shop identity</h2><form id="shop-form"><label>Shop name<input name="name" required maxlength="120" value="${esc(shop().name)}" ${canEdit() ? "" : "disabled"}></label><label>Address<input name="address" maxlength="200" value="${esc(shop().address)}" ${canEdit() ? "" : "disabled"}></label><label>Phone<input name="phone" maxlength="30" value="${esc(shop().phone)}" ${canEdit() ? "" : "disabled"}></label>${canEdit() ? '<button class="primary">Save shop details</button>' : ""}</form></section><section class="section-card"><h2>Your data, kept safe.</h2><p class="muted">Export this workspace’s products, receipts and pending sales. Keep the file private.</p><button id="backup">Export backup</button>${selected === "local" ? '<p><label>Restore local backup<input type="file" id="restore" accept="application/json,.json"></label><small>Restore is available only into an empty local workspace. Cloud shops are restored through the central database, not by replacing shared stock.</small></p>' : ""}<hr class="receipt-rule"><h3>Cloud connection</h3><p class="muted">${user ? `Signed in as ${esc(user.email)}` : "Sign in with Google to create or join a shop."}</p><button id="account-settings">${user ? "Manage account" : "Connect Google"}</button><p><small>All synced shop records are stored on the platform owner’s Cloudflare account and can be accessed by the Master Super Admin.</small></p></section></div>${selected !== "local" && canEdit() ? '<section class="section-card"><h2>Your team</h2><div id="members">Loading team…</div><form id="invite-form" class="inline"><input name="email" type="email" placeholder="Cashier’s Google email" required aria-label="Cashier email"><button class="primary">Add cashier</button></form><p><small>Cashiers can sell and view shop sales. Only owners and the master administrator can change stock and manage the team.</small></p></section>' : ""}<section class="section-card"><h2>About this first version</h2><p class="muted">Sales counter, inventory, expiry blocking, receipts, offline sales, Google login, shop isolation and master administration are included. Supplier purchases, customer dues, returns, automated Drive backup, Bengali translation and native Bluetooth printing are planned additions.</p></section>`;
+  $("#shop-form").onsubmit = async (e) => {
+    e.preventDefault();
+    try {
+      const f = Object.fromEntries(new FormData(e.target));
+      if (selected === "local") {
+        const next = { ...state, shop: { ...state.shop, ...f } };
+        await save(next);
+        state = next;
+      } else {
+        await api(`/api/shops/${selected}/settings`, {
+          method: "POST",
+          body: JSON.stringify(f),
+        });
+        await loadMe();
+        await refresh();
+      }
+      render();
+      toast("Shop details saved.");
+    } catch (e) {
+      showError(e);
+    }
+  };
+  $("#backup").onclick = () =>
+    download(
+      `KhuM-PoS-backup-${today()}.json`,
+      JSON.stringify(
+        {
+          format: "khum-pos-v1",
+          exported_at: new Date().toISOString(),
+          workspace: selected,
+          ...state,
+        },
+        null,
+        2,
+      ),
+    );
+  $("#account-settings").onclick = account;
+  $("#restore")?.addEventListener("change", async (e) => {
+    try {
+      if (state.products.length || state.sales.length)
+        throw Error(
+          "Restore needs an empty local workspace. Export existing data first.",
+        );
+      const file = e.target.files[0];
+      if (!file) return;
+      if (file.size > 10000000) throw Error("Backup is too large.");
+      const data = JSON.parse(await file.text());
+      validateBackup(data);
+      const next = {
+        products: data.products,
+        sales: data.sales,
+        pending: [],
+        shop: { ...data.shop, id: "local", role: "owner" },
+      };
+      await save(next);
+      state = next;
+      render();
+      toast("Backup restored into the local workspace.");
+    } catch (e) {
+      showError(e);
+    }
+  });
+  if ($("#members")) loadMembers().catch(showError);
+  $("#invite-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      await api(`/api/shops/${selected}/members`, {
+        method: "POST",
+        body: JSON.stringify(Object.fromEntries(new FormData(e.target))),
+      });
+      e.target.reset();
+      await loadMembers();
+      toast("Cashier access saved. They can now sign in.");
+    } catch (e) {
+      showError(e);
+    }
+  });
+}
+function validateBackup(b) {
+  if (
+    b.format !== "khum-pos-v1" ||
+    !Array.isArray(b.products) ||
+    !Array.isArray(b.sales) ||
+    typeof b.shop?.name !== "string"
+  )
+    throw Error("Invalid backup format");
+  if (b.pending?.length)
+    throw Error(
+      "This backup contains pending cloud sales. Sync those from the original device; do not restore them as new sales.",
+    );
+  const ids = new Set();
+  for (const p of b.products) {
+    if (
+      typeof p.id !== "string" ||
+      ids.has(p.id) ||
+      typeof p.name !== "string" ||
+      typeof p.category !== "string" ||
+      typeof p.unit !== "string" ||
+      typeof p.expiry !== "string"
+    )
+      throw Error("Invalid backup product");
+    ids.add(p.id);
+    for (const k of ["price", "cost", "stock", "low_stock"]) integer(p[k]);
+  }
+  for (const s of b.sales) {
+    if (typeof s.id !== "string" || !Number.isFinite(Date.parse(s.created_at)))
+      throw Error("Invalid receipt");
+    for (const k of ["total", "discount", "subtotal", "tendered"])
+      integer(s[k]);
+    if (s.total !== s.subtotal - s.discount)
+      throw Error("Invalid receipt total");
+    if (s.lines && totals(s.lines, s.discount).total !== s.total)
+      throw Error("Invalid receipt lines");
+  }
+}
+async function loadMembers() {
+  const m = await api(`/api/shops/${selected}/members`);
+  if (!$("#members")) return;
+  $("#members").innerHTML = [
+    ...m.members,
+    ...m.invites.map((x) => ({ ...x, role: "invited" })),
+  ]
+    .map(
+      (p) =>
+        `<p class="inline"><span>${esc(p.email)} · ${esc(p.role)}</span>${p.role !== "owner" ? `<button data-remove-user="${esc(p.user_id || "")}" data-email="${esc(p.email)}" class="text-button error">Remove</button>` : ""}</p>`,
+    )
+    .join("");
+  document.querySelectorAll("[data-remove-user]").forEach(
+    (b) =>
+      (b.onclick = async () => {
+        try {
+          await api(`/api/shops/${selected}/members`, {
+            method: "DELETE",
+            body: JSON.stringify({
+              user_id: b.dataset.removeUser,
+              email: b.dataset.email,
+            }),
+          });
+          await loadMembers();
+        } catch (e) {
+          showError(e);
+        }
+      }),
+  );
+}
+async function account() {
+  modal(
+    `<h2>${user ? "Your account" : "Connect your store."}</h2>${user ? `<p>${esc(user.name)}<br><small>${esc(user.email)}</small></p><p>Your Google subject ID: <code>${esc(user.id)}</code></p><button id="signout">Sign out</button><hr class="receipt-rule"><h3>Create a cloud shop</h3><form id="create-shop"><label>Shop name<input name="name" required maxlength="120" placeholder="e.g. Hill View Mini Mart"></label><label class="check-label"><input type="checkbox" required name="consent">I understand that synced shop records are stored on the platform owner’s Cloudflare database and the Master Super Admin can access them.</label><button class="primary">Create shop</button></form>` : `<p class="muted">One account for your shop. Your products and sales stay separate from other shops.</p>${native ? '<label>Cloudflare app address<input id="api-url" type="url" placeholder="https://your-app.workers.dev" value="' + esc(apiBase) + '"></label><button class="primary" id="device-login">Sign in in browser</button>' : '<div id="google-button"></div><p id="login-status" class="muted">Loading Google sign-in…</p>'}`}<div id="device-link"></div>`,
+  );
+  $("#signout")?.addEventListener("click", async () => {
+    if (syncing) return toast("Please wait for synchronization.");
+    if (state.pending.length)
+      return toast("Sync or export your pending sales before signing out.");
+    try {
+      await api("/api/auth/logout", { method: "POST" });
+    } catch (e) {
+      return showError(e);
+    }
+    auth = "";
+    localStorage.removeItem("khum-session");
+    user = null;
+    shops = [];
+    selected = "local";
+    await loadWorkspace();
+    closeModal();
+    render();
+  });
+  $("#create-shop")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const btn = e.submitter;
+    btn.disabled = true;
+    try {
+      if (syncing) throw Error("Please wait for synchronization.");
+      const f = new FormData(e.target),
+        s = await api("/api/shops", {
+          method: "POST",
+          body: JSON.stringify({ name: f.get("name"), consent: true }),
+        });
+      await loadMe();
+      selected = s.id;
+      localStorage.setItem("khum-shop", selected);
+      await loadWorkspace();
+      await refresh();
+      closeModal();
+      toast("Cloud shop created. Add products in Stock.");
+    } catch (e) {
+      showError(e);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+  if (!user && !native) googleLogin().catch(showError);
+  $("#device-login")?.addEventListener("click", deviceLogin);
+  const linkCode = new URL(location.href).searchParams.get("link");
+  if (user && linkCode) {
+    $("#device-link").innerHTML =
+      `<hr class="receipt-rule"><h3>Link an Android device</h3><p>Only approve this if you just started sign-in on your own KhuM PoS Android app and its code matches:</p><h2>${esc(linkCode)}</h2><button id="approve-device" class="primary">Approve this device</button>`;
+    $("#approve-device").onclick = async () => {
+      try {
+        await api("/api/auth/device/approve", {
+          method: "POST",
+          body: JSON.stringify({ code: linkCode }),
+        });
+        $("#device-link").textContent =
+          "Device approved. Return to the KhuM PoS app.";
+        history.replaceState({}, "", location.pathname);
+      } catch (e) {
+        showError(e);
+      }
+    };
+  }
+}
+async function googleLogin() {
+  config = await api("/api/config");
+  if (!config.googleClientId) {
+    $("#login-status").textContent =
+      "Google sign-in is not configured yet. Follow docs/DEPLOYMENT.md in the repository.";
+    return;
+  }
+  if (!window.google) {
+    await new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = "https://accounts.google.com/gsi/client";
+      s.onload = resolve;
+      s.onerror = () =>
+        reject(Error("Could not load Google sign-in. Check your connection."));
+      document.head.appendChild(s);
+    });
+  }
+  google.accounts.id.initialize({
+    client_id: config.googleClientId,
+    callback: async (r) => {
+      try {
+        const result = await api("/api/auth/google", {
+          method: "POST",
+          body: JSON.stringify({ credential: r.credential }),
+        });
+        auth = result.token;
+        localStorage.setItem("khum-session", auth);
+        await loadMe();
+        await loadWorkspace();
+        account();
+      } catch (e) {
+        showError(e);
+      }
+    },
+  });
+  if ($("#google-button")) {
+    google.accounts.id.renderButton($("#google-button"), {
+      theme: "outline",
+      size: "large",
+      text: "signin_with",
+    });
+    $("#login-status").textContent = "Use your Google account to continue.";
+  }
+}
+async function deviceLogin() {
+  try {
+    const url = new URL($("#api-url").value);
+    if (url.protocol !== "https:" || url.username || url.password)
+      throw Error("Enter a secure HTTPS Cloudflare address");
+    apiBase = url.origin;
+    localStorage.setItem("khum-api", apiBase);
+    pairing = await api("/api/auth/device/start", { method: "POST" });
+    const pairingSecret = pairing.secret,
+      deadline = Date.now() + 600000;
+    $("#device-link").innerHTML =
+      `<p>Device code: <strong>${esc(pairing.code)}</strong></p><p>Approve the matching code in your browser. Keep this screen open.</p>`;
+    await Browser.open({
+      url: `${apiBase}/?link=${encodeURIComponent(pairing.code)}`,
+    });
+    const poll = async () => {
+      if (!pairing || Date.now() > deadline) return;
+      try {
+        const result = await api("/api/auth/device/poll", {
+          method: "POST",
+          body: JSON.stringify({ secret: pairingSecret }),
+        });
+        if (result.token) {
+          pairing = null;
+          auth = result.token;
+          localStorage.setItem("khum-session", auth);
+          await loadMe();
+          await loadWorkspace();
+          await Browser.close().catch(() => {});
+          closeModal();
+          toast("Google account connected.");
+          return;
+        }
+      } catch (e) {
+        if (e.status === 410) {
+          pairing = null;
+          return showError(e);
+        }
+      }
+      setTimeout(poll, 5000);
+    };
+    setTimeout(poll, 5000);
+  } catch (e) {
+    showError(e);
+  }
+}
+async function admin() {
+  if (!user?.master) return;
+  $("#content").innerHTML = '<p class="muted">Loading platform records…</p>';
+  const data = await api("/api/admin");
+  if (view !== "admin") return;
+  $("#content").innerHTML =
+    `<div class="notice">Master Super Admin · All central shop data is accessible here. Administrative access is recorded in the audit log.</div><div class="three" style="margin-bottom:20px"><div class="stat"><small>Shops</small><strong>${data.shops.length}</strong></div><div class="stat"><small>Cloud receipts</small><strong>${data.shops.reduce((s, x) => s + x.sales, 0)}</strong></div><div class="stat"><small>Recorded cloud revenue</small><strong>${money(data.shops.reduce((s, x) => s + x.revenue, 0))}</strong></div></div><section class="section-card"><h2>Shops</h2><div class="table-wrap"><table><thead><tr><th>Shop</th><th>Members</th><th>Sales</th><th>Revenue</th><th>Status</th><th></th></tr></thead><tbody>${data.shops.map((s) => `<tr><td>${esc(s.name)}</td><td>${s.members}</td><td>${s.sales}</td><td>${money(s.revenue)}</td><td>${s.active ? "Active" : "Suspended"}</td><td><button data-open-shop="${esc(s.id)}">Open shop</button> <button data-status-shop="${esc(s.id)}" data-active="${s.active}">${s.active ? "Suspend" : "Activate"}</button></td></tr>`).join("") || '<tr><td colspan="6">No shops registered yet.</td></tr>'}</tbody></table></div></section><section class="section-card"><h2>Recent platform activity</h2><div class="table-wrap"><table><thead><tr><th>Time</th><th>Action</th><th>Shop</th><th>Actor</th></tr></thead><tbody>${data.audit.map((a) => `<tr><td>${esc(a.created_at)}</td><td>${esc(a.action)}</td><td>${esc(a.shop_id || "Platform")}</td><td>${esc(a.actor)}</td></tr>`).join("")}</tbody></table></div></section>`;
+  document.querySelectorAll("[data-open-shop]").forEach(
+    (b) =>
+      (b.onclick = async () => {
+        if (syncing) return toast("Please wait for synchronization.");
+        selected = b.dataset.openShop;
+        localStorage.setItem("khum-shop", selected);
+        view = "counter";
+        await loadWorkspace();
+        await refresh();
+      }),
+  );
+  document.querySelectorAll("[data-status-shop]").forEach(
+    (b) =>
+      (b.onclick = () => {
+        modal(
+          `<h2>${b.dataset.active === "1" ? "Suspend" : "Activate"} this shop?</h2><p>Suspending blocks cloud access for its owner and cashiers. Already cached offline sales remain on their devices until access is restored.</p><button id="confirm-status" class="primary">Confirm change</button>`,
+        );
+        $("#confirm-status").onclick = async () => {
+          try {
+            await api(`/api/shops/${b.dataset.statusShop}/status`, {
+              method: "POST",
+              body: JSON.stringify({ active: b.dataset.active !== "1" }),
+            });
+            await loadMe();
+            closeModal();
+            render();
+          } catch (e) {
+            showError(e);
+          }
+        };
+      }),
+  );
+}
+async function scan() {
+  if (!("BarcodeDetector" in window))
+    return modal(
+      "<h2>Barcode entry</h2><p>Camera barcode detection is unavailable on this device. Use a USB/Bluetooth keyboard scanner in the search field, or type the barcode and press Enter.</p>",
+    );
+  try {
+    const supported = await BarcodeDetector.getSupportedFormats(),
+      formats = ["ean_13", "ean_8", "upc_a", "upc_e", "code_128"].filter((f) =>
+        supported.includes(f),
+      );
+    if (!formats.length) throw Error("No supported barcode formats");
+    const detector = new BarcodeDetector({ formats });
+    modal(
+      '<h2>Scan a product</h2><video id="camera" autoplay playsinline style="width:100%;border-radius:10px"></video><p class="muted">Point the camera at the product barcode.</p>',
+    );
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "environment" },
+    });
+    $("#camera").srcObject = stream;
+    const tick = async () => {
+      if (!stream || !$("#modal").open) return;
+      try {
+        const codes = await detector.detect($("#camera"));
+        if (codes.length) {
+          const p = state.products.find((p) => p.barcode === codes[0].rawValue);
+          closeModal();
+          if (p) add(p.id);
+          else toast("Barcode not found in your stock.");
+          return;
+        }
+      } catch {}
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  } catch (e) {
+    closeModal();
+    showError(
+      Error("Camera unavailable. Type or scan into the search field instead."),
+    );
+  }
+}
+window.addEventListener("online", () => {
+  if (selected !== "local" && auth) sync().catch(showError);
+  else render();
+});
+window.addEventListener("offline", render);
+async function init() {
+  await openDB();
+  await navigator.storage?.persist?.().catch(() => {});
+  if (!native) {
+    apiBase = "";
+    if ("serviceWorker" in navigator)
+      navigator.serviceWorker.register("/sw.js").catch(() => {});
+  }
+  if (auth) {
+    try {
+      await loadMe();
+    } catch (e) {
+      if (e.status === 401) {
+        auth = "";
+        localStorage.removeItem("khum-session");
+        selected = "local";
+      } else {
+        user = JSON.parse(localStorage.getItem("khum-user") || "null");
+        shops = JSON.parse(localStorage.getItem("khum-shops") || "[]");
+        toast("Offline account cache loaded.");
+      }
+    }
+  }
+  if (user) {
+    localStorage.setItem("khum-user", JSON.stringify(user));
+    localStorage.setItem("khum-shops", JSON.stringify(shops));
+  }
+  await loadWorkspace();
+  if (selected !== "local" && auth && navigator.onLine) sync().catch(showError);
+  if (new URL(location.href).searchParams.has("link")) account();
+}
+init().catch((e) => {
+  $("#app").innerHTML =
+    '<div class="workspace"><h1>KhuM PoS could not open device storage.</h1><p>Please allow browser storage or free some space, then reload.</p></div>';
+  console.error(e);
+});
