@@ -23,7 +23,7 @@ Add these Actions secrets:
 
 Run **Build signed Android APK** manually. It fails if signing inputs are missing, rather than labeling an unsigned APK as a release. Download `KhuM-PoS-signed-release` after success. This workflow does not publish to Google Play or create a GitHub release automatically.
 
-The app ID is `com.khum.pos`. v0.1.0 uses versionCode 1 and versionName 0.1.0; increase versionCode for future releases. `scripts/android-config.mjs` applies these settings to the generated Android project.
+The app ID is `com.khum.pos`. v0.2.0 uses versionCode 2 and versionName 0.2.0; increase versionCode for future releases. `scripts/android-config.mjs` applies these settings to the generated Android project.
 
 A debug APK and a release APK have different signing identities. Android may require uninstalling a debug build before installing release; export/sync testing data before uninstalling. Production upgrades must use the same permanent release key.
 
@@ -36,3 +36,7 @@ The **Publish APKs to Releases** workflow archives successful Android build arti
 Each build has its own release/tag and artifact-specific APK filename. Existing release assets are preserved, and rerunning the publisher does not upload the same artifact twice. Release assets remain available after Actions artifacts expire.
 
 The first publisher run backfills all available successful historical builds. You can run the publisher manually from Actions to repeat that backfill. Expired Actions artifacts that were never copied to Releases cannot be recovered by this workflow; the logs identify any skipped expired artifacts. No new signing key is created by publication.
+
+## Cloud backup on Android
+
+Use Settings → Google Drive backup. The initial Drive consent opens the deployed app in the external browser; sign in with the same account and connect that shop there. Return to the APK afterward. Scheduled backups run on the server, so the app need not remain open. Browse / restore retrieves files through the authenticated API; restore creates a separate local workspace and does not replace the active cloud shop. See [BACKUPS.md](BACKUPS.md) for administrator activation.

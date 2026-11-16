@@ -1,3 +1,4 @@
+import { validateArchive, archiveToLocal, BACKUP_FORMAT } from "./backup.js";
 import {
   money,
   today,
@@ -28,6 +29,11 @@ const $ = (s) => document.querySelector(s),
         })[c],
     );
 const native = Capacitor.isNativePlatform();
+const isLocal = (id = selected) =>
+  id === "local" || String(id).startsWith("local-restore-");
+let cloudError = "",
+  lastAutoSync = 0,
+  authExpired = false;
 let db,
   user = null,
   shops = [],
@@ -40,7 +46,9 @@ let db,
   busy = false,
   syncing = false;
 let auth = localStorage.getItem("khum-session") || "",
-  apiBase = localStorage.getItem("khum-api") || (native ? "https://khum-pos.manas-tripura.workers.dev" : ""),
+  apiBase =
+    localStorage.getItem("khum-api") ||
+    (native ? "https://khum-pos.manas-tripura.workers.dev" : ""),
   config = {};
 let pairing = null,
   stream = null;
@@ -92,7 +100,7 @@ const empty = () => ({
 const key = () =>
   selected === "local" ? "local" : `${user?.id || "signed-out"}:${selected}`;
 const shop = () =>
-  selected === "local"
+  isLocal()
     ? state?.shop || localShop
     : shops.find((s) => s.id === selected) || state?.shop || {};
 const canEdit = () => ["owner", "master"].includes(shop().role);
@@ -153,29 +161,49 @@ function save(value = state, k = key()) {
   });
 }
 async function api(path, options = {}) {
-  const res = await fetch(apiBase + path, {
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      ...(auth ? { Authorization: `Bearer ${auth}` } : {}),
-      ...options.headers,
-    },
-  });
-  const data = await res.json();
-  if (!res.ok)
-    throw Object.assign(Error(data.error || "Request failed"), {
-      status: res.status,
+  const controller = new AbortController(),
+    timeout = setTimeout(() => controller.abort(), 45000);
+  try {
+    const res = await fetch(apiBase + path, {
+      ...options,
+      signal: controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+        ...(auth ? { Authorization: `Bearer ${auth}` } : {}),
+        ...options.headers,
+      },
     });
-  return data;
+    const data = await res.json();
+    if (!res.ok) {
+      if (res.status === 401) authExpired = true;
+      throw Object.assign(Error(data.error || "Request failed"), {
+        status: res.status,
+      });
+    }
+    return data;
+  } catch (e) {
+    if (e.name === "AbortError")
+      throw Error(
+        "Connection timed out. Your pending sales are still saved on this device.",
+      );
+    throw e;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 async function loadWorkspace() {
+  if (
+    String(selected).startsWith("local-restore-") &&
+    !localRestores().some((x) => x.id === selected)
+  )
+    selected = "local";
   state = (await read(key())) || empty();
-  if (selected !== "local") state.shop = { ...shop() };
+  if (!isLocal()) state.shop = { ...shop() };
   cart = [];
   render();
 }
 async function refresh() {
-  if (selected === "local" || !auth) return;
+  if (isLocal() || !auth) return;
   if (state.pending.length)
     throw Error("Sync pending sales before refreshing stock.");
   const snap = await api(`/api/shops/${selected}/snapshot`);
@@ -184,6 +212,7 @@ async function refresh() {
     shop: snap.shop,
     products: snap.products,
     sales: snap.sales,
+    last_sync: new Date().toISOString(),
   };
   await save(next);
   state = next;
@@ -195,7 +224,12 @@ async function loadMe() {
   shops = me.shops;
   localStorage.setItem("khum-user", JSON.stringify(user));
   localStorage.setItem("khum-shops", JSON.stringify(shops));
-  if (selected !== "local" && !shops.some((s) => s.id === selected))
+  const requested = new URL(location.href).searchParams.get("driveShop");
+  if (requested && shops.some((s) => s.id === requested)) {
+    selected = requested;
+    view = "settings";
+  }
+  if (!isLocal() && !shops.some((s) => s.id === selected))
     selected = shops[0]?.id || "local";
 }
 function modal(html) {
@@ -224,14 +258,21 @@ function render() {
   const s = shop(),
     pending = state.pending.length;
   $("#app").innerHTML =
-    `<div class="shell"><aside class="rail"><div class="brand">K.</div>${nav.map(([id, i, t]) => `<button data-view="${id}" class="${view === id ? "active" : ""}" aria-label="${t}"><span>${i}</span>${t}</button>`).join("")}${user?.master ? `<button data-view="admin" class="${view === "admin" ? "active" : ""}"><span>♜</span>Platform</button>` : ""}<button class="bottom" data-action="account"><span>◎</span>Account</button></aside><main class="main"><header class="topbar"><div class="inline"><div class="wordmark">KhuM <b>PoS</b></div><span class="muted">/</span><select id="shop-select" class="shopselect" aria-label="Select shop"><option value="local">${esc(state.shop?.id === "local" ? state.shop.name : "Local workspace")}</option>${shops.map((x) => `<option value="${esc(x.id)}" ${selected === x.id ? "selected" : ""}>${esc(x.name)}${x.active ? "" : " · suspended"}</option>`).join("")}</select></div><div class="top-actions"><span class="badge ${pending || !navigator.onLine ? "warn" : ""}">${selected === "local" ? "LOCAL ONLY" : pending ? `${pending} pending` : navigator.onLine ? "CLOUD CONNECTED" : "OFFLINE"}</span><button class="text-button" data-action="sync">↻ Sync</button><button class="avatar" data-action="account" aria-label="Account">${esc((user?.name || "K")[0])}</button></div></header><div class="workspace"><div class="intro"><div><div class="eyebrow">${view === "counter" ? "Your everyday counter" : esc(s.name || "KhuM PoS")}</div><h1>${{ counter: "Good things, in store.", stock: "Everything on your shelves.", sales: "Every sale, accounted for.", settings: "Make it your store.", admin: "Your platform, at a glance." }[view]}</h1><p class="muted" style="font-size:13px;margin-bottom:0">${{ counter: "A little less paperwork. A little more business.", stock: "Keep prices and quantities up to date.", sales: "Local receipts and the latest 500 cloud sales.", settings: "Shop details, team access and your data.", admin: "Manage shops and review platform activity." }[view]}</p></div><span class="date muted">${new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric", timeZone: "Asia/Dhaka" })}</span></div>${selected === "local" ? '<div class="notice">Local workspace · Saved on this device only. Sign in and create a cloud shop to share stock between devices. Local sample data stays separate.</div>' : ""}${state.pending.some((p) => p.error) ? '<div class="notice">A pending sale needs attention. Open Sales to review the sync error. Keep this device’s backup until resolved.</div>' : ""}<div id="content"></div><div class="footer-note">KhuM PoS · Made for your everyday business · v0.1.0</div></div></main></div>`;
+    `<div class="shell"><aside class="rail"><div class="brand">K.</div>${nav.map(([id, i, t]) => `<button data-view="${id}" class="${view === id ? "active" : ""}" aria-label="${t}"><span>${i}</span>${t}</button>`).join("")}${user?.master ? `<button data-view="admin" class="${view === "admin" ? "active" : ""}"><span>♜</span>Platform</button>` : ""}<button class="bottom" data-action="account"><span>◎</span>Account</button></aside><main class="main"><header class="topbar"><div class="inline"><div class="wordmark">KhuM <b>PoS</b></div><span class="muted">/</span><select id="shop-select" class="shopselect" aria-label="Select shop"><option value="local">${esc(state.shop?.id === "local" ? state.shop.name : "Local workspace")}</option>${localRestores()
+      .map(
+        (x) =>
+          `<option value="${esc(x.id)}" ${selected === x.id ? "selected" : ""}>${esc(x.name)}</option>`,
+      )
+      .join(
+        "",
+      )}${shops.map((x) => `<option value="${esc(x.id)}" ${selected === x.id ? "selected" : ""}>${esc(x.name)}${x.active ? "" : " · suspended"}</option>`).join("")}</select></div><div class="top-actions"><span class="badge ${pending || !navigator.onLine ? "warn" : ""}">${isLocal() ? "LOCAL ONLY" : pending ? `${pending} pending` : !navigator.onLine ? "OFFLINE" : cloudError ? "SYNC NEEDS ATTENTION" : state.last_sync ? "CLOUD SYNCED" : "SYNC NOT VERIFIED"}</span><button class="text-button" data-action="sync">↻ Sync</button><button class="avatar" data-action="account" aria-label="Account">${esc((user?.name || "K")[0])}</button></div></header><div class="workspace"><div class="intro"><div><div class="eyebrow">${view === "counter" ? "Your everyday counter" : esc(s.name || "KhuM PoS")}</div><h1>${{ counter: "Good things, in store.", stock: "Everything on your shelves.", sales: "Every sale, accounted for.", settings: "Make it your store.", admin: "Your platform, at a glance." }[view]}</h1><p class="muted" style="font-size:13px;margin-bottom:0">${{ counter: "A little less paperwork. A little more business.", stock: "Keep prices and quantities up to date.", sales: "Local receipts and the latest 500 cloud sales.", settings: "Shop details, team access and your data.", admin: "Manage shops and review platform activity." }[view]}</p></div><span class="date muted">${new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric", timeZone: "Asia/Dhaka" })}</span></div>${isLocal() ? '<div class="notice">Local workspace · Saved on this device only. Sign in and create a cloud shop to share stock between devices. Local sample data stays separate.</div>' : ""}${state.pending.some((p) => p.error) ? '<div class="notice">A pending sale needs attention. Open Sales to review the sync error. Keep this device’s backup until resolved.</div>' : ""}<div id="content"></div><div class="footer-note">KhuM PoS · Made for your everyday business · v0.2.0</div></div></main></div>`;
   $("#shop-select").value = selected;
   $("#shop-select").disabled = syncing;
   $("#shop-select").onchange = async (e) => {
     selected = e.target.value;
     localStorage.setItem("khum-shop", selected);
     await loadWorkspace();
-    if (selected !== "local")
+    if (!isLocal())
       try {
         await refresh();
       } catch (e) {
@@ -258,7 +299,7 @@ function render() {
 function counter() {
   const cats = ["All", ...new Set(state.products.map((p) => p.category))];
   $("#content").innerHTML =
-    `<div class="pos-layout"><section><div class="searchbar"><input id="search" placeholder="Search products or scan a barcode…" aria-label="Search products"><button id="scan">▥ Scan</button></div><div class="chips">${cats.map((c) => `<button data-category="${esc(c)}" class="${category === c ? "selected" : ""}">${esc(c)}</button>`).join("")}</div><div id="products" class="products"></div>${!state.products.length ? `<div class="section-card"><h2>Your shelves are ready.</h2><p class="muted">Add your first product in Stock, or explore a local sample store.</p>${selected === "local" ? '<button id="samples" class="primary">Load sample products</button>' : "<button data-view-stock>Add your first product</button>"}</div>` : ""}</section><aside class="receipt-panel" id="receipt-panel"></aside></div><button class="mobile-receipt primary" id="jump-receipt">Receipt · ${cart.length} items ↓</button>`;
+    `<div class="pos-layout"><section><div class="searchbar"><input id="search" placeholder="Search products or scan a barcode…" aria-label="Search products"><button id="scan">▥ Scan</button></div><div class="chips">${cats.map((c) => `<button data-category="${esc(c)}" class="${category === c ? "selected" : ""}">${esc(c)}</button>`).join("")}</div><div id="products" class="products"></div>${!state.products.length ? `<div class="section-card"><h2>Your shelves are ready.</h2><p class="muted">Add your first product in Stock, or explore a local sample store.</p>${isLocal() ? '<button id="samples" class="primary">Load sample products</button>' : "<button data-view-stock>Add your first product</button>"}</div>` : ""}</section><aside class="receipt-panel" id="receipt-panel"></aside></div><button class="mobile-receipt primary" id="jump-receipt">Receipt · ${cart.length} items ↓</button>`;
   $("#search").value = search;
   $("#search").oninput = (e) => {
     search = e.target.value;
@@ -333,7 +374,7 @@ function add(id) {
 function receipt() {
   const t = totals(cart);
   $("#receipt-panel").innerHTML =
-    `<div class="receipt-heading"><h2>Current receipt</h2><small>${String(cart.length).padStart(2, "0")} items</small></div><div class="receipt-paper"><div class="receipt-brand">${esc(shop().name)}</div><div class="receipt-sub">${esc(shop().address || "Your neighbourhood store")}<br>${esc(shop().phone)}</div><hr class="receipt-rule"><div class="receipt-row"><span>${today()}</span><span>NEW SALE</span></div><hr class="receipt-rule">${cart.length ? cart.map((l) => `<div class="receipt-row"><div class="item-name">${esc(l.name)}<br><small>${qty(l.qty)} × ${money(l.price)}</small><br><button data-qty="${esc(l.product_id)}">Edit qty</button><button data-remove="${esc(l.product_id)}" aria-label="Remove ${esc(l.name)}">×</button></div><strong>${money(lineTotal(l.price, l.qty))}</strong></div>`).join("") : '<div class="empty-cart">Your next sale starts here.<br>Add something from the shelves.</div>'}<hr class="receipt-rule"><div class="receipt-row"><span>SUBTOTAL</span><strong>${money(t.subtotal)}</strong></div><div class="receipt-sub">Thank you for shopping local.</div></div><div class="two"><label>Discount (৳)<input id="discount" type="number" min="0" step="0.01" value="0"></label><label>Payment<select id="payment"><option>Cash</option><option>Card</option><option>Mobile</option></select></label></div><label>Amount received (৳)<input id="tendered" type="number" min="0" step="0.01" value="${t.total / 100}"></label><div class="checkout-total"><span>Total to pay</span><strong id="pay-total">${money(t.total)}</strong></div><div class="receipt-row" style="font-size:12px"><span>Change</span><strong id="change">${money(0)}</strong></div><button id="checkout" class="primary checkout" ${!cart.length || busy ? "disabled" : ""}>Complete sale →</button><p class="receipt-note">${selected === "local" ? "Saved locally on this device" : "Saved on device first · then synced to your shop"}</p>`;
+    `<div class="receipt-heading"><h2>Current receipt</h2><small>${String(cart.length).padStart(2, "0")} items</small></div><div class="receipt-paper"><div class="receipt-brand">${esc(shop().name)}</div><div class="receipt-sub">${esc(shop().address || "Your neighbourhood store")}<br>${esc(shop().phone)}</div><hr class="receipt-rule"><div class="receipt-row"><span>${today()}</span><span>NEW SALE</span></div><hr class="receipt-rule">${cart.length ? cart.map((l) => `<div class="receipt-row"><div class="item-name">${esc(l.name)}<br><small>${qty(l.qty)} × ${money(l.price)}</small><br><button data-qty="${esc(l.product_id)}">Edit qty</button><button data-remove="${esc(l.product_id)}" aria-label="Remove ${esc(l.name)}">×</button></div><strong>${money(lineTotal(l.price, l.qty))}</strong></div>`).join("") : '<div class="empty-cart">Your next sale starts here.<br>Add something from the shelves.</div>'}<hr class="receipt-rule"><div class="receipt-row"><span>SUBTOTAL</span><strong>${money(t.subtotal)}</strong></div><div class="receipt-sub">Thank you for shopping local.</div></div><div class="two"><label>Discount (৳)<input id="discount" type="number" min="0" step="0.01" value="0"></label><label>Payment<select id="payment"><option>Cash</option><option>Card</option><option>Mobile</option></select></label></div><label>Amount received (৳)<input id="tendered" type="number" min="0" step="0.01" value="${t.total / 100}"></label><div class="checkout-total"><span>Total to pay</span><strong id="pay-total">${money(t.total)}</strong></div><div class="receipt-row" style="font-size:12px"><span>Change</span><strong id="change">${money(0)}</strong></div><button id="checkout" class="primary checkout" ${!cart.length || busy ? "disabled" : ""}>Complete sale →</button><p class="receipt-note">${isLocal() ? "Saved locally on this device" : "Saved on device first · then synced to your shop"}</p>`;
   const calc = () => {
     try {
       const total = totals(cart, cents($("#discount").value)).total;
@@ -416,13 +457,13 @@ async function checkout() {
     for (const l of lines)
       next.products.find((p) => p.id === l.product_id).stock -= l.qty;
     next.sales.unshift(sale);
-    if (selected !== "local") next.pending.push(sale);
+    if (!isLocal()) next.pending.push(sale);
     await save(next);
     state = next;
     cart = [];
     render();
     await showReceipt(sale);
-    if (selected !== "local") sync().catch(showError);
+    if (!isLocal()) setTimeout(() => sync().catch(showError), 0);
   } catch (e) {
     showError(e);
     if (view === "counter") receipt();
@@ -433,7 +474,7 @@ async function checkout() {
 }
 async function showReceipt(sale) {
   let lines = sale.lines;
-  if (!lines && selected !== "local") {
+  if (!lines && !isLocal()) {
     try {
       lines = (await api(`/api/shops/${selected}/sales/${sale.id}`)).lines;
     } catch (e) {
@@ -458,19 +499,23 @@ async function showReceipt(sale) {
       "text/html",
     );
 }
-async function sync() {
-  if (syncing) return;
-  if (selected === "local")
+async function sync(options = {}) {
+  if (syncing || busy || cart.length) return;
+  if (isLocal())
     return toast("This workspace is local. Sign in to use a cloud shop.");
   if (!navigator.onLine)
     throw Error("Offline. Sales remain saved here until you reconnect.");
-  if (!auth) throw Error("Sign in to sync.");
+  if (!auth || authExpired)
+    throw Error(
+      "Session expired. Open Account and reauthenticate Google to sync your saved sales.",
+    );
   syncing = true;
   $("#shop-select").disabled = true;
   const workspace = key();
   try {
     for (const pending of [...state.pending]) {
       if (key() !== workspace) break;
+      if (options.background && pending.retryable === false) continue;
       try {
         await api(`/api/shops/${selected}/sales`, {
           method: "POST",
@@ -483,14 +528,31 @@ async function sync() {
       } catch (e) {
         const next = structuredClone(state),
           p = next.pending.find((p) => p.id === pending.id);
-        if (p) p.error = e.message;
+        if (p) {
+          p.error = e.message;
+          p.retryable = e.status !== 409 && e.status !== 403;
+        }
         await save(next);
         state = next;
-        throw e;
+        if (e.status !== 409 && e.status !== 403) throw e;
       }
     }
     if (key() === workspace && !state.pending.length) await refresh();
-    toast("Shop synchronized.");
+    cloudError = state.pending.length ? "Pending sales need review" : "";
+    lastAutoSync = Date.now();
+    if (state.drive?.connected && state.drive.backup?.enabled)
+      api("/api/drive/backup", {
+        method: "POST",
+        body: JSON.stringify({ shop_id: selected }),
+      }).catch(() => {});
+    toast(
+      state.pending.length
+        ? `${state.pending.length} sale(s) still need review. Other uploads completed.`
+        : "Shop synchronized.",
+    );
+  } catch (e) {
+    cloudError = e.message;
+    throw e;
   } finally {
     syncing = false;
     render();
@@ -555,7 +617,7 @@ function productForm(p) {
         )
       )
         throw Error("Barcode already belongs to another product.");
-      if (selected === "local") {
+      if (isLocal()) {
         const next = structuredClone(state),
           i = next.products.findIndex((x) => x.id === item.id);
         if (i >= 0) next.products[i] = item;
@@ -592,7 +654,7 @@ function sales() {
         }) === day,
     );
   $("#content").innerHTML =
-    `<div class="three" style="margin-bottom:20px"><div class="stat"><small>Today’s recorded sales</small><strong>${money(daily.reduce((s, x) => s + x.total, 0))}</strong></div><div class="stat"><small>Today’s receipts</small><strong>${daily.length}</strong></div><div class="stat"><small>Awaiting cloud sync</small><strong>${state.pending.length}</strong></div></div>${state.pending.length ? `<section class="section-card"><h2>Pending sales</h2><p class="muted">Saved locally and already deducted from this device’s stock. Review errors before retrying.</p>${state.pending.map((p) => `<p><strong>${esc(p.id.slice(0, 8))}</strong> · ${money(p.total)}<br><small class="error">${esc(p.error || "Waiting for connection")}</small></p>`).join("")}<button id="retry-sync">Retry sync</button><p><small>Conflicts are kept for review; no sale is silently deleted or counted twice. Export a backup before changing devices.</small></p></section>` : ""}<section class="section-card"><div class="section-title"><h2>Sales history</h2><button id="export-sales">Export CSV</button></div><div class="table-wrap"><table><thead><tr><th>Receipt</th><th>Date · Dhaka</th><th>Payment</th><th>Total</th><th>Status</th><th></th></tr></thead><tbody>${state.sales.map((s) => `<tr><td>${esc(s.id.slice(0, 8))}</td><td>${esc(new Date(s.created_at).toLocaleString("en-GB", { timeZone: "Asia/Dhaka" }))}</td><td>${esc(s.payment)}</td><td>${money(s.total)}</td><td>${selected === "local" ? "Local" : state.pending.some((p) => p.id === s.id) ? "Pending" : "Synced"}</td><td><button data-receipt="${esc(s.id)}">Receipt</button></td></tr>`).join("") || '<tr><td colspan="6">Your first completed sale will appear here.</td></tr>'}</tbody></table></div></section>`;
+    `<div class="three" style="margin-bottom:20px"><div class="stat"><small>Today’s recorded sales</small><strong>${money(daily.reduce((s, x) => s + x.total, 0))}</strong></div><div class="stat"><small>Today’s receipts</small><strong>${daily.length}</strong></div><div class="stat"><small>Awaiting cloud sync</small><strong>${state.pending.length}</strong></div></div>${state.pending.length ? `<section class="section-card"><h2>Pending sales</h2><p class="muted">Saved locally and already deducted from this device’s stock. Review errors before retrying.</p>${state.pending.map((p) => `<p><strong>${esc(p.id.slice(0, 8))}</strong> · ${money(p.total)}<br><small class="error">${esc(p.error || "Waiting for connection")}</small></p>`).join("")}<button id="retry-sync">Retry sync</button><p><small>Conflicts are kept for review; no sale is silently deleted or counted twice. Export a backup before changing devices.</small></p></section>` : ""}<section class="section-card"><div class="section-title"><h2>Sales history</h2><button id="export-sales">Export CSV</button></div><div class="table-wrap"><table><thead><tr><th>Receipt</th><th>Date · Dhaka</th><th>Payment</th><th>Total</th><th>Status</th><th></th></tr></thead><tbody>${state.sales.map((s) => `<tr><td>${esc(s.id.slice(0, 8))}</td><td>${esc(new Date(s.created_at).toLocaleString("en-GB", { timeZone: "Asia/Dhaka" }))}</td><td>${esc(s.payment)}</td><td>${money(s.total)}</td><td>${isLocal() ? "Local" : state.pending.some((p) => p.id === s.id) ? "Pending" : "Synced"}</td><td><button data-receipt="${esc(s.id)}">Receipt</button></td></tr>`).join("") || '<tr><td colspan="6">Your first completed sale will appear here.</td></tr>'}</tbody></table></div></section>`;
   $("#retry-sync")?.addEventListener("click", () => sync().catch(showError));
   document
     .querySelectorAll("[data-receipt]")
@@ -651,12 +713,12 @@ async function download(name, content, type = "application/json") {
 }
 function settings() {
   $("#content").innerHTML =
-    `<div class="two"><section class="section-card"><h2>Shop identity</h2><form id="shop-form"><label>Shop name<input name="name" required maxlength="120" value="${esc(shop().name)}" ${canEdit() ? "" : "disabled"}></label><label>Address<input name="address" maxlength="200" value="${esc(shop().address)}" ${canEdit() ? "" : "disabled"}></label><label>Phone<input name="phone" maxlength="30" value="${esc(shop().phone)}" ${canEdit() ? "" : "disabled"}></label>${canEdit() ? '<button class="primary">Save shop details</button>' : ""}</form></section><section class="section-card"><h2>Your data, kept safe.</h2><p class="muted">Export this workspace’s products, receipts and pending sales. Keep the file private.</p><button id="backup">Export backup</button>${selected === "local" ? '<p><label>Restore local backup<input type="file" id="restore" accept="application/json,.json"></label><small>Restore is available only into an empty local workspace. Cloud shops are restored through the central database, not by replacing shared stock.</small></p>' : ""}<hr class="receipt-rule"><h3>Cloud connection</h3><p class="muted">${user ? `Signed in as ${esc(user.email)}` : "Sign in with Google to create or join a shop."}</p><button id="account-settings">${user ? "Manage account" : "Connect Google"}</button><p><small>All synced shop records are stored on the platform owner’s Cloudflare account and can be accessed by the Master Super Admin.</small></p></section></div>${selected !== "local" && canEdit() ? '<section class="section-card"><h2>Your team</h2><div id="members">Loading team…</div><form id="invite-form" class="inline"><input name="email" type="email" placeholder="Cashier’s Google email" required aria-label="Cashier email"><button class="primary">Add cashier</button></form><p><small>Cashiers can sell and view shop sales. Only owners and the master administrator can change stock and manage the team.</small></p></section>' : ""}<section class="section-card"><h2>About this first version</h2><p class="muted">Sales counter, inventory, expiry blocking, receipts, offline sales, Google login, shop isolation and master administration are included. Supplier purchases, customer dues, returns, automated Drive backup, Bengali translation and native Bluetooth printing are planned additions.</p></section>`;
+    `<div class="two"><section class="section-card"><h2>Shop identity</h2><form id="shop-form"><label>Shop name<input name="name" required maxlength="120" value="${esc(shop().name)}" ${canEdit() ? "" : "disabled"}></label><label>Address<input name="address" maxlength="200" value="${esc(shop().address)}" ${canEdit() ? "" : "disabled"}></label><label>Phone<input name="phone" maxlength="30" value="${esc(shop().phone)}" ${canEdit() ? "" : "disabled"}></label>${canEdit() ? '<button class="primary">Save shop details</button>' : ""}</form></section><section class="section-card"><h2>Your data, kept safe.</h2><p class="muted">Export this workspace’s products, receipts and pending sales. Keep the file private.</p><button id="backup">Export backup</button>${isLocal() ? '<p><label>Restore local backup<input type="file" id="restore" accept="application/json,.json"></label><small>Restore is available only into an empty local workspace. Cloud shops are restored through the central database, not by replacing shared stock.</small></p>' : ""}<hr class="receipt-rule"><h3>Cloud connection</h3><p class="muted">${user ? `Signed in as ${esc(user.email)}` : "Sign in with Google to create or join a shop."}</p><button id="account-settings">${user ? "Manage account" : "Connect Google"}</button><p><small>All synced shop records are stored on the platform owner’s Cloudflare account and can be accessed by the Master Super Admin.</small></p></section></div>${!isLocal() && canEdit() ? '<section class="section-card"><h2>Your team</h2><div id="members">Loading team…</div><form id="invite-form" class="inline"><input name="email" type="email" placeholder="Cashier’s Google email" required aria-label="Cashier email"><button class="primary">Add cashier</button></form><p><small>Cashiers can sell and view shop sales. Only owners and the master administrator can change stock and manage the team.</small></p></section>' : ""}${!isLocal() && canEdit() ? '<section class="section-card" id="drive-panel">Loading Drive backup status…</section>' : ""}<section class="section-card"><h2>About this first version</h2><p class="muted">Sales counter, inventory, expiry blocking, receipts, offline sales, Google login, shop isolation and master administration are included. Supplier purchases, customer dues, returns, Bengali translation and native Bluetooth printing are planned additions.</p></section>`;
   $("#shop-form").onsubmit = async (e) => {
     e.preventDefault();
     try {
       const f = Object.fromEntries(new FormData(e.target));
-      if (selected === "local") {
+      if (isLocal()) {
         const next = { ...state, shop: { ...state.shop, ...f } };
         await save(next);
         state = next;
@@ -691,20 +753,25 @@ function settings() {
   $("#account-settings").onclick = account;
   $("#restore")?.addEventListener("change", async (e) => {
     try {
-      if (state.products.length || state.sales.length)
-        throw Error(
-          "Restore needs an empty local workspace. Export existing data first.",
-        );
       const file = e.target.files[0];
       if (!file) return;
       if (file.size > 10000000) throw Error("Backup is too large.");
       const data = JSON.parse(await file.text());
+      if (data.format === BACKUP_FORMAT) {
+        await restoreArchive(data);
+        return;
+      }
+      if (state.products.length || state.sales.length)
+        throw Error(
+          "Local backup restore needs an empty local workspace. Export existing data first.",
+        );
       validateBackup(data);
       const next = {
         products: data.products,
         sales: data.sales,
         pending: [],
-        shop: { ...data.shop, id: "local", role: "owner" },
+        revision: state.revision || 0,
+        shop: { ...data.shop, id: selected, role: "owner" },
       };
       await save(next);
       state = next;
@@ -715,6 +782,7 @@ function settings() {
     }
   });
   if ($("#members")) loadMembers().catch(showError);
+  if ($("#drive-panel")) loadDrivePanel().catch(showError);
   $("#invite-form")?.addEventListener("submit", async (e) => {
     e.preventDefault();
     try {
@@ -797,10 +865,15 @@ async function loadMembers() {
       }),
   );
 }
-async function account() {
+async function account(forceLogin = false) {
+  const showUser = !!user && forceLogin !== true;
   modal(
-    `<h2>${user ? "Your account" : "Connect your store."}</h2>${user ? `<p>${esc(user.name)}<br><small>${esc(user.email)}</small></p><p>Your Google subject ID: <code>${esc(user.id)}</code></p><button id="signout">Sign out</button><hr class="receipt-rule"><h3>Create a cloud shop</h3><form id="create-shop"><label>Shop name<input name="name" required maxlength="120" placeholder="e.g. Hill View Mini Mart"></label><label class="check-label"><input type="checkbox" required name="consent">I understand that synced shop records are stored on the platform owner’s Cloudflare database and the Master Super Admin can access them.</label><button class="primary">Create shop</button></form>` : `<p class="muted">One account for your shop. Your products and sales stay separate from other shops.</p>${native ? '<label>Cloudflare app address<input id="api-url" type="url" placeholder="https://your-app.workers.dev" value="' + esc(apiBase) + '"></label><button class="primary" id="device-login">Sign in in browser</button>' : '<div id="google-button"></div><p id="login-status" class="muted">Loading Google sign-in…</p>'}`}<div id="device-link"></div>`,
+    `<h2>${showUser ? "Your account" : "Connect your store."}</h2>${showUser ? `<p>${esc(user.name)}<br><small>${esc(user.email)}</small></p><p>Your Google subject ID: <code>${esc(user.id)}</code></p><button id="signout">Sign out</button> <button id="reauthenticate">Reauthenticate Google</button><hr class="receipt-rule"><h3>Create a cloud shop</h3><form id="create-shop"><label>Shop name<input name="name" required maxlength="120" placeholder="e.g. Hill View Mini Mart"></label><label class="check-label"><input type="checkbox" required name="consent">I understand that synced shop records are stored on the platform owner’s Cloudflare database and the Master Super Admin can access them.</label><button class="primary">Create shop</button></form>` : `<p class="muted">One account for your shop. Your products and sales stay separate from other shops.</p>${native ? '<label>Cloudflare app address<input id="api-url" type="url" placeholder="https://your-app.workers.dev" value="' + esc(apiBase) + '"></label><button class="primary" id="device-login">Sign in in browser</button>' : '<div id="google-button"></div><p id="login-status" class="muted">Loading Google sign-in…</p>'}`}<div id="device-link"></div>`,
   );
+  $("#reauthenticate")?.addEventListener("click", () => {
+    if (syncing) return toast("Wait for sync to finish.");
+    account(true);
+  });
   $("#signout")?.addEventListener("click", async () => {
     if (syncing) return toast("Please wait for synchronization.");
     if (state.pending.length)
@@ -843,7 +916,7 @@ async function account() {
       btn.disabled = false;
     }
   });
-  if (!user && !native) googleLogin().catch(showError);
+  if (!showUser && !native) googleLogin().catch(showError);
   $("#device-login")?.addEventListener("click", deviceLogin);
   const linkCode = new URL(location.href).searchParams.get("link");
   if (user && linkCode) {
@@ -890,10 +963,15 @@ async function googleLogin() {
           body: JSON.stringify({ credential: r.credential }),
         });
         auth = result.token;
+        authExpired = false;
         localStorage.setItem("khum-session", auth);
         await loadMe();
         await loadWorkspace();
-        account();
+        if (new URL(location.href).searchParams.has("driveShop")) {
+          closeModal();
+          view = "settings";
+          render();
+        } else account();
       } catch (e) {
         showError(e);
       }
@@ -933,6 +1011,7 @@ async function deviceLogin() {
         if (result.token) {
           pairing = null;
           auth = result.token;
+          authExpired = false;
           localStorage.setItem("khum-session", auth);
           await loadMe();
           await loadWorkspace();
@@ -1036,7 +1115,7 @@ async function scan() {
   }
 }
 window.addEventListener("online", () => {
-  if (selected !== "local" && auth) sync().catch(showError);
+  if (!isLocal() && auth) sync().catch(showError);
   else render();
 });
 window.addEventListener("offline", render);
@@ -1068,11 +1147,212 @@ async function init() {
     localStorage.setItem("khum-shops", JSON.stringify(shops));
   }
   await loadWorkspace();
-  if (selected !== "local" && auth && navigator.onLine) sync().catch(showError);
-  if (new URL(location.href).searchParams.has("link")) account();
+  if (!isLocal() && auth && navigator.onLine) sync().catch(showError);
+  const query = new URL(location.href).searchParams;
+  if (query.has("link") || (!user && query.has("driveShop"))) account();
+  if (query.has("drive")) {
+    toast(
+      query.get("drive") === "connected"
+        ? "Google Drive connected. Open Settings and use Backup now for your first snapshot."
+        : "Drive authorization did not complete. Reconnect using the same Google account.",
+    );
+    history.replaceState({}, "", location.pathname);
+  }
 }
 init().catch((e) => {
   $("#app").innerHTML =
     '<div class="workspace"><h1>KhuM PoS could not open device storage.</h1><p>Please allow browser storage or free some space, then reload.</p></div>';
   console.error(e);
+});
+
+function localRestores() {
+  try {
+    return JSON.parse(
+      localStorage.getItem("khum-restores:" + (user?.id || "local")) || "[]",
+    );
+  } catch {
+    return [];
+  }
+}
+async function loadDrivePanel() {
+  const container = $("#drive-panel"), workspaceAtStart=key();
+  if (!container) return;
+  try {
+    const status = await api(
+      "/api/drive/status?shop=" + encodeURIComponent(selected),
+    );
+    if (!$("#drive-panel")||key()!==workspaceAtStart) return;
+    state.drive = status;
+    container.innerHTML = `<h2>Google Drive backup</h2><p>Backups contain this shop’s full synchronized products and receipt history. Pending offline sales remain on their original device.</p><p><span class="badge ${status.backup?.last_error ? "warn" : ""}">${!status.configured ? "ADMIN SETUP REQUIRED" : !status.connected ? "NOT CONNECTED" : status.backup?.enabled ? "AUTOMATIC BACKUP ON" : "AUTOMATIC BACKUP OFF"}</span></p><p class="muted">Last successful backup/check: ${esc(status.backup?.last_success ? new Date(status.backup.last_success).toLocaleString() : "Not yet backed up")}</p>${status.backup?.last_error ? `<p class="error">${esc(status.backup.last_error)}</p>` : ""}<p><small>Automatic checks run on the server after connection, including when the app is closed. Changed data is backed up daily; Backup now creates a new snapshot immediately. Backups are kept as separate files in this app’s private Google Drive folder.</small></p>${!status.configured ? '<p class="notice">The platform administrator must finish Google Drive API, OAuth callback and encrypted-token setup. Existing Cloudflare sync continues working.</p>' : `<div class="inline"><button id="connect-drive" class="primary">${status.connected ? "Reconnect Google Drive" : "Connect Google Drive"}</button>${status.connected ? '<button id="drive-backup-now">Backup now</button><button id="drive-toggle">' + (status.backup?.enabled ? "Pause automatic backup" : "Enable automatic backup") + "</button>" : ""}</div>`}<p><button id="drive-browse" ${!status.connected ? "disabled" : ""}>Browse / restore Drive backups</button> <button id="full-export">Download full cloud backup</button>${status.connected ? ' <button id="drive-disconnect" class="text-button">Disconnect Drive</button>' : ""}</p><p><small>Drive authorization is separate from Google sign-in. Each owner chooses their own Google account. Disconnect stops automatic backups for all your shops; existing backup files are preserved.</small></p>`;
+    $("#connect-drive")?.addEventListener("click", () => {
+      modal(
+        '<h2>Connect Google Drive?</h2><p>This authorizes KhuM PoS to store and read backup files in its private folder in your Google Drive. It does not request access to your other Drive files.</p><p>Full synchronized shop products, costs, stock and receipts will be copied there automatically. Use the same Google account as your KhuM PoS login.</p><button id="start-drive" class="primary">Continue to Google</button>',
+      );
+      $("#start-drive").onclick = async () => {
+        try {
+          if (native) {
+            await Browser.open({
+              url: apiBase + "/?driveShop=" + encodeURIComponent(selected),
+            });
+            closeModal();
+            return;
+          }
+          const r = await api("/api/drive/connect", {
+            method: "POST",
+            body: JSON.stringify({ shop_id: selected, consent: true }),
+          });
+          location.assign(r.url);
+        } catch (e) {
+          showError(e);
+        }
+      };
+    });
+    $("#drive-backup-now")?.addEventListener("click", async (e) => {
+      e.target.disabled = true;
+      try {
+        const r = await api("/api/drive/backup", {
+          method: "POST",
+          body: JSON.stringify({ shop_id: selected, force: true }),
+        });
+        toast(
+          r.running
+            ? "A backup is already running."
+            : "Google Drive backup saved.",
+        );
+        await loadDrivePanel();
+      } catch (e) {
+        showError(e);
+        await loadDrivePanel();
+      }
+    });
+    $("#drive-toggle")?.addEventListener("click", async () => {
+      try {
+        await api("/api/drive/preferences", {
+          method: "POST",
+          body: JSON.stringify({
+            shop_id: selected,
+            enabled: !status.backup?.enabled,
+          }),
+        });
+        await loadDrivePanel();
+      } catch (e) {
+        showError(e);
+      }
+    });
+    $("#drive-disconnect")?.addEventListener("click", () => {
+      modal(
+        '<h2>Disconnect Google Drive?</h2><p>This stops automatic backups for all shops connected to your Google account. Existing Drive backup files will remain. Cloudflare sync continues.</p><button id="confirm-drive-disconnect" class="primary">Disconnect</button>',
+      );
+      $("#confirm-drive-disconnect").onclick = async () => {
+        try {
+          await api("/api/drive/disconnect", { method: "POST", body: "{}" });
+          closeModal();
+          await loadDrivePanel();
+        } catch (e) {
+          showError(e);
+        }
+      };
+    });
+    $("#full-export").onclick = async () => {
+      try {
+        const b = await api(
+          "/api/drive/export?shop=" + encodeURIComponent(selected),
+        );
+        await download(
+          "KhuM-full-cloud-backup-" + today() + ".json",
+          JSON.stringify(b),
+        );
+      } catch (e) {
+        showError(e);
+      }
+    };
+    $("#drive-browse").onclick = () => browseDrive().catch(showError);
+  } catch (e) {
+    container.innerHTML =
+      '<h2>Google Drive backup</h2><p class="error">' + esc(e.message) + "</p>";
+  }
+}
+async function browseDrive(pageToken = "") {
+  const r = await api(
+    "/api/drive/files" +
+      (pageToken ? "?pageToken=" + encodeURIComponent(pageToken) : ""),
+  );
+  modal(
+    `<h2>Your Google Drive backups</h2><p class="muted">Choose a snapshot to inspect. Restore creates a separate local workspace and never changes live cloud stock. Showing up to 100 snapshots.</p>${r.files.map((f) => `<p><strong>${esc(f.name)}</strong><br><small>${esc(f.createdTime)} · ${esc(f.size)} bytes</small><br><button data-preview-backup="${esc(f.id)}">Preview / restore</button></p>`).join("") || "<p>No backup snapshots yet. Use Backup now first.</p>"}${r.nextPageToken ? '<button id="more-drive-backups">Next page</button>' : ""}`,
+  );
+  document
+    .querySelectorAll("[data-preview-backup]")
+    .forEach(
+      (b) =>
+        (b.onclick = () =>
+          previewDrive(b.dataset.previewBackup).catch(showError)),
+    );
+  $("#more-drive-backups")?.addEventListener("click", () =>
+    browseDrive(r.nextPageToken).catch(showError),
+  );
+}
+async function previewDrive(id) {
+  const b = validateArchive(
+    await api("/api/drive/files/" + encodeURIComponent(id)),
+  );
+  modal(
+    `<h2>${esc(b.shop.name)}</h2><p>Snapshot: ${esc(b.created_at)}<br>${b.products.length} products · ${b.sales.length} receipts · ${b.lines.length} receipt lines</p><p class="notice">This will create a separate local copy. It will not replace or merge the live cloud shop, resend historical receipts, or deduct stock again.</p><button id="restore-drive-copy" class="primary">Restore as a separate local copy</button> <button id="download-drive-copy">Download backup file</button>`,
+  );
+  $("#download-drive-copy").onclick = () =>
+    download("KhuM-Drive-backup-" + id + ".json", JSON.stringify(b));
+  $("#restore-drive-copy").onclick = () => restoreArchive(b).catch(showError);
+}
+async function restoreArchive(b) {
+  if (syncing || busy || cart.length)
+    throw Error("Finish the current sale or sync first.");
+  const newId = "local-restore-" + crypto.randomUUID(),
+    next = archiveToLocal(b, newId);
+  await save(next, `${user?.id || "signed-out"}:${newId}`);
+  const list = localRestores();
+  list.unshift({ id: newId, name: next.shop.name });
+  localStorage.setItem(
+    "khum-restores:" + (user?.id || "local"),
+    JSON.stringify(list),
+  );
+  selected = newId;
+  localStorage.setItem("khum-shop", selected);
+  view = "stock";
+  closeModal();
+  await loadWorkspace();
+  toast("Backup restored as a separate local copy.");
+}
+
+setInterval(() => {
+  if (
+    !state ||
+    !auth ||
+    authExpired ||
+    isLocal() ||
+    !navigator.onLine ||
+    busy ||
+    syncing ||
+    cart.length ||
+    document.hidden ||
+    $("#modal").open
+  )
+    return;
+  if (
+    state.pending.length
+      ? state.pending.some((p) => p.retryable !== false)
+      : Date.now() - lastAutoSync > 300000
+  )
+    sync({ background: true }).catch((e) => {
+      cloudError = e.message;
+    });
+}, 30000);
+window.addEventListener("visibilitychange", () => {
+  if (
+    !document.hidden &&
+    !isLocal() &&
+    auth &&
+    !cart.length &&
+    !busy &&
+    !$("#modal").open
+  )
+    sync().catch(showError);
 });

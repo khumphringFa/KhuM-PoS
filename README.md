@@ -2,7 +2,7 @@
 
 An offline-capable Android and web point of sale for groceries and mini-superstores. Forest-green product cards and a paper-style receipt, inspired by the reference reel. Prices use Bangladeshi taka; all receipt amounts are stored in integer paisa and quantities in thousandths of a unit.
 
-## Included in v0.1.0
+## Included in v0.2.0
 
 - Responsive counter, product/category search and keyboard barcode scanning.
 - Camera scanning where the device browser supports BarcodeDetector; manual entry everywhere.
@@ -16,7 +16,9 @@ An offline-capable Android and web point of sale for groceries and mini-supersto
 - Master overview, shop suspension/reactivation, access to shop records and audit log.
 - Explicit shop-registration disclosure of central storage and master access.
 - Android Capacitor build, external-browser device linking, backup/receipt export through Android's share sheet.
-- Local JSON backup/restore into an empty local workspace; cloud snapshots are not blindly imported over shared stock.
+- Local JSON backup/restore and full cloud JSON export.
+- Optional automatic Google Drive app-folder snapshots with encrypted refresh tokens, daily scheduled backups, Backup now, integrity checks and restored local copies. Administrator OAuth/secret setup and each owner’s explicit Drive consent are required.
+- Periodic foreground cloud refresh, queued-sale retries, verified sync timestamps and Google reauthentication without clearing pending sales.
 
 ## Quick local start
 
@@ -57,7 +59,7 @@ The APK contains the UI assets so the local counter can start offline. For cloud
 
 Each sale has a UUID idempotency key. D1 commits the sale header and stock-deducting lines in one atomic batch. Database constraints and a trigger prevent overselling, expired stock and conflicting prices. Repeated uploads return the existing receipt without a second stock deduction.
 
-Different devices can sell cached stock while offline, so overselling cannot be ruled out until synchronization. A conflicting sale stays pending with an error; it is **never silently discarded, repriced, or counted twice**. The operator must reconcile it before using that workspace normally. Pending sales block product edits and snapshot replacement. Keep the original device and export a backup until reconciled. Automatic conflict resolution/voiding is not in v0.1.0.
+Different devices can sell cached stock while offline, so overselling cannot be ruled out until synchronization. A conflicting sale stays pending with an error; it is **never silently discarded, repriced, or counted twice**. The operator must reconcile it before using that workspace normally. Pending sales block product edits and snapshot replacement. Keep the original device and export a backup until reconciled. Automatic conflict resolution/voiding is not in v0.2.0.
 
 Each product currently represents one stock/expiry record. Use separate products for separate expiry batches. Full batch allocation is planned.
 
@@ -67,7 +69,9 @@ Shop owners see their own shop; cashiers can sell and view its products/receipts
 
 Device-local data is accessible to whoever can unlock that device/browser profile. Sign-out removes the session and switches to the local workspace; it preserves the account's cached records for later sign-in. Use dedicated, locked devices for shops. Suspension/revocation blocks the API immediately but cannot remotely erase already cached offline records.
 
-The cloud sales screen shows the latest 500 receipts; all receipts remain in D1. CSV export covers the currently loaded history. Automated Drive backups, a full archival export, supplier purchasing, customer credit/dues, refunds, profit reports, Bengali translation, product photos and Bluetooth printer support are **not implemented yet**.
+The cloud sales screen shows the latest 500 receipts; all receipts remain in D1. CSV export covers the currently loaded history. Supplier purchasing, customer credit/dues, refunds, profit reports, Bengali translation, product photos and Bluetooth printer support are **not implemented yet**.
+
+Drive configuration and recovery procedures are in [docs/BACKUPS.md](docs/BACKUPS.md). Backups include the full synchronized history, with an 8 MiB per-snapshot limit; they fail visibly instead of silently truncating. Restores are separate local copies, not destructive replacements of live stock. A new device normally signs in and selects the existing cloud shop; no historical receipts are re-uploaded.
 
 ## Verification
 

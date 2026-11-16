@@ -1,3 +1,9 @@
+import {
+  driveRoute,
+  driveCallback,
+  scheduledBackups,
+  driveConfigured,
+} from "./drive.js";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { integer, totals, validateCart, today } from "../public/core.js";
 const keys = createRemoteJWKSet(
@@ -122,6 +128,7 @@ export async function route(req, env) {
       googleClientId: env.GOOGLE_CLIENT_ID || "",
       configured: !!env.GOOGLE_CLIENT_ID,
       masterConfigured: !!env.MASTER_GOOGLE_SUB,
+      driveConfigured: driveConfigured(env),
     });
   if (!env.DB) fail("Database not configured", 503);
   if (path === "/api/auth/google" && method === "POST") {
@@ -196,7 +203,11 @@ export async function route(req, env) {
     if (!results[0].results.length) fail("Device already linked", 410);
     return json({ token: await session(env, d.user_id) });
   }
+  const callback = await driveCallback(req, env);
+  if (callback) return callback;
   const u = await identity(req, env);
+  const drive = await driveRoute(req, env, u);
+  if (drive) return drive;
   if (path === "/api/auth/logout" && method === "POST") {
     await stmt(
       env,
@@ -592,6 +603,7 @@ export default {
     return res;
   },
   async scheduled(_event, env) {
+    await scheduledBackups(env);
     await env.DB.batch([
       stmt(env, "DELETE FROM sessions WHERE expires<?", now()),
       stmt(env, "DELETE FROM devices WHERE expires<?", now()),

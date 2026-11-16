@@ -1,9 +1,10 @@
-const CACHE = "khum-pos-v1";
+const CACHE = "khum-pos-v2";
 const FILES = [
   "/",
   "/index.html",
   "/app.js",
   "/core.js",
+  "/backup.js",
   "/native.js",
   "/style.css",
   "/icon.svg",

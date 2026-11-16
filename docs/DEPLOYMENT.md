@@ -64,7 +64,7 @@ For Cloudflare Git integration instead, use build command `npm ci && npm run bui
 7. Review both shops from the master Platform screen.
 8. Take a D1 backup/export before using real stock. For a full central SQL export run `npx wrangler d1 export DB --remote --output khum-pos-backup.sql`; store the export privately.
 
-Google Drive API backup is a separate future integration. Google login does **not** automatically back up to Google Drive. Until then, use local JSON exports and D1 exports. Keep files with business records private.
+Google Drive backups require the separate administrator setup and each owner’s Drive consent described in [BACKUPS.md](BACKUPS.md). Google login alone does **not** grant Drive access. Full cloud JSON exports and D1 exports remain available independently. Keep files with business records private.
 
 ## References
 

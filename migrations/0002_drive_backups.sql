@@ -1,0 +1,4 @@
+CREATE TABLE IF NOT EXISTS drive_connections (user_id TEXT PRIMARY KEY REFERENCES users(id), refresh_token TEXT NOT NULL, connected_at TEXT NOT NULL, last_error TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS drive_states (hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), shop_id TEXT NOT NULL REFERENCES shops(id), verifier TEXT NOT NULL, expires INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS drive_backups (user_id TEXT NOT NULL REFERENCES users(id), shop_id TEXT NOT NULL REFERENCES shops(id), enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)), last_success TEXT, last_attempt INTEGER NOT NULL DEFAULT 0, last_file_id TEXT, content_hash TEXT, last_error TEXT NOT NULL DEFAULT '', locked_until INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(user_id,shop_id));
+CREATE INDEX IF NOT EXISTS drive_backups_due ON drive_backups(enabled,last_attempt);
